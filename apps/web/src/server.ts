@@ -1284,13 +1284,15 @@ const dashboardHTML = `<!DOCTYPE html>
     }
 
     async function fetchAlerts() {
+      const list = document.getElementById('alertsList');
       try {
         const res = await fetch('/api/alerts');
+        if (!res.ok) throw new Error('API error: ' + res.status);
+        
         const data = await res.json();
         const alerts = Object.values(data.alarms || {});
         
         document.getElementById('alertsCount').textContent = alerts.length;
-        const list = document.getElementById('alertsList');
         
         if (alerts.length === 0) {
           list.innerHTML = '<div class="alert-row" style="justify-content: center; color: var(--accent);">✓ All systems normal</div>';
@@ -1306,7 +1308,11 @@ const dashboardHTML = `<!DOCTYPE html>
             </div>
           \`).join('');
         }
-      } catch (e) {}
+      } catch (e) {
+        console.error('Alerts fetch error:', e);
+        list.innerHTML = '<div class="alert-row" style="justify-content: center; color: var(--error);">⚠ Failed to load alerts</div>';
+        document.getElementById('alertsCount').textContent = '?';
+      }
     }
 
     async function fetchInfo() {
@@ -1521,6 +1527,10 @@ const dashboardHTML = `<!DOCTYPE html>
     }
 
     function refreshAll() {
+      // Show loading states
+      document.getElementById('alertsList').innerHTML = '<div class="alert-row" style="justify-content: center; color: var(--text-muted);">Refreshing...</div>';
+      document.getElementById('processBody').innerHTML = '<tr><td colspan="3" style="text-align: center; color: var(--text-muted);">Refreshing...</td></tr>';
+      
       fetchCPU();
       fetchMemory();
       fetchNetwork();
@@ -1533,10 +1543,14 @@ const dashboardHTML = `<!DOCTYPE html>
     }
 
     function refreshAlerts() {
+      const list = document.getElementById('alertsList');
+      list.innerHTML = '<div class="alert-row" style="justify-content: center; color: var(--text-muted);">Refreshing...</div>';
       fetchAlerts();
     }
 
     function refreshProcesses() {
+      const tbody = document.getElementById('processBody');
+      tbody.innerHTML = '<tr><td colspan="3" style="text-align: center; color: var(--text-muted);">Refreshing...</td></tr>';
       fetchProcesses();
     }
     
@@ -1643,7 +1657,7 @@ const dashboardHTML = `<!DOCTYPE html>
             refreshPendingActions();
           }
         };
-        ws.onclose = () => setTimeout(connectWebSocket, 3000);
+        ws.onclose = () => setTimeout(connectWebSocket, 3001);
       } catch (e) {
         console.log('WebSocket not available');
       }
@@ -1704,15 +1718,15 @@ const dashboardHTML = `<!DOCTYPE html>
     mainLoop();
     setInterval(mainLoop, 1000);
     setInterval(fetchAlerts, 5000);
-    setInterval(fetchProcesses, 3000);
+    setInterval(fetchProcesses, 3001);
   </script>
 </body>
 </html>
 `
 
 export default {
-  port: 3000,
+  port: 3001,
   fetch: app.fetch,
 }
 
-console.log('🔷 AIOps Command Center BEAST MODE running at http://localhost:3000')
+console.log('🔷 AIOps Command Center BEAST MODE running at http://localhost:3001')
