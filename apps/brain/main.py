@@ -32,7 +32,7 @@ app.add_middleware(
 
 # Configuration
 NETDATA_URL = os.getenv("NETDATA_URL", "http://localhost:19999")
-CEREBRAS_API_KEY = os.getenv("CEREBRAS_API_KEY", "")
+CEREBRAS_API_KEY = 'csk-vtykhvxvxhtnrtdrd3p892v48nfpd2mt49tpx4mr68d69559'
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://aiops:aiops_password@localhost:5432/aiops_brain")
 
 # Database pool
@@ -516,9 +516,11 @@ async def chat(request: ChatRequest):
     tools_used = []
     message_lower = request.message.lower()
     
-    # Check if user wants remediation
+    # Check if user wants remediation (includes log cleaning)
     wants_fix = any(word in message_lower for word in [
-        "fix", "remediate", "restart", "kill", "stop", "resolve", "clear", "scale"
+        "fix", "remediate", "restart", "kill", "stop", "resolve", "clear", "clean", 
+        "scale", "purge", "truncate", "archive", "delete log", "remove log", 
+        "clean log", "clean postgres", "clear cache", "clear log"
     ])
     
     # Check if investigation needed
@@ -577,6 +579,7 @@ async def chat(request: ChatRequest):
         
         if assistant_msg.tool_calls:
             # Process tool calls
+            last_pending_action = None
             for tc in assistant_msg.tool_calls:
                 tool_name = tc.function.name
                 tools_used.append(tool_name)
@@ -586,6 +589,12 @@ async def chat(request: ChatRequest):
                     args = {}
                 
                 result = await execute_tool(tool_name, args)
+                
+                # Capture the last pending action if propose_remediation was called
+                if tool_name == "propose_remediation" and pending_actions_memory:
+                    # Get the most recently created action from memory
+                    last_pending_action = list(pending_actions_memory.values())[-1]  # Get the last added action
+                
                 messages.append({"role": "assistant", "content": assistant_msg.content or "",
                                "tool_calls": [{"id": tc.id, "type": "function", "function": {"name": tool_name, "arguments": tc.function.arguments}}]})
                 messages.append({"role": "tool", "tool_call_id": tc.id, "content": result})
@@ -599,7 +608,8 @@ async def chat(request: ChatRequest):
             return ChatResponse(
                 response=final.choices[0].message.content,
                 tools_used=tools_used,
-                investigation_complete=is_investigation
+                investigation_complete=is_investigation,
+                pending_action=last_pending_action
             )
         
         return ChatResponse(response=assistant_msg.content or "I understand. How can I help?", tools_used=[])
@@ -690,6 +700,11 @@ async def approve_action(action_id: str, request: ApprovalRequest):
             "message": "Action approved (action details not found for execution)"
         }
     else:
+        return {
+            "status": "rejected",
+            "action_id": action_id,
+            "message": "Action rejected by human operator"
+        }
         return {
             "status": "rejected",
             "action_id": action_id,

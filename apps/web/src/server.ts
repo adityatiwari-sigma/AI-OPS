@@ -64,6 +64,31 @@ app.get('/api/info', async (c) => {
   }
 })
 
+// API: Get Top Processes using ps command
+app.get('/api/processes', async (c) => {
+  try {
+    const proc = Bun.spawn(['ps', 'aux', '--sort=-%cpu']);
+    const output = await new Response(proc.stdout).text();
+    const lines = output.trim().split('\n');
+
+    // Skip header, take top 10
+    const processes = lines.slice(1, 11).map(line => {
+      const parts = line.trim().split(/\s+/);
+      return {
+        user: parts[0],
+        pid: parts[1],
+        cpu: parseFloat(parts[2]) || 0,
+        mem: parseFloat(parts[3]) || 0,
+        command: parts.slice(10).join(' ').substring(0, 50)
+      };
+    });
+
+    return c.json({ processes });
+  } catch (error) {
+    return c.json({ error: 'Failed to fetch processes', processes: [] }, 500);
+  }
+})
+
 // API: Chat with AI Brain
 app.post('/api/chat', async (c) => {
   const body = await c.req.json()
@@ -156,7 +181,24 @@ const dashboardHTML = `<!DOCTYPE html>
       --chart-2: #43a9ff;
       --chart-3: #f5a623;
       --chart-4: #a855f7;
+      --chart-4: #a855f7;
       --chart-5: #ff4d4f;
+    }
+
+    [data-theme="light"] {
+      --bg-primary: #ffffff;
+      --bg-secondary: #f9f9f9;
+      --bg-card: #ffffff;
+      --bg-card-hover: #f0f0f0;
+      --border: #e5e5e5;
+      --text-primary: #111111;
+      --text-secondary: #555555;
+      --text-muted: #888888;
+      --accent: #10a37f; /* OpenaAI Green stays similar */
+      --accent-light: #1ec99f;
+      --warning: #f5a623; 
+      --error: #ef4444;
+      --info: #3b82f6;
     }
     
     * {
@@ -374,11 +416,21 @@ const dashboardHTML = `<!DOCTYPE html>
       color: var(--bg-primary);
     }
     
+    .view-section {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+      width: 100%;
+    }
+    
     /* Dashboard Grid */
     .dashboard {
       flex: 1;
       overflow-y: auto;
       padding: 24px;
+      display: flex;
+      flex-direction: column;
     }
     
     .dashboard-header {
@@ -586,14 +638,14 @@ const dashboardHTML = `<!DOCTYPE html>
       position: fixed;
       bottom: 24px;
       right: 24px;
-      width: 420px;
+      width: 480px; 
       background: var(--bg-card);
       border: 1px solid var(--border);
       border-radius: 16px;
       box-shadow: 0 8px 32px rgba(0,0,0,0.5);
       display: flex;
       flex-direction: column;
-      max-height: 500px;
+      max-height: 600px;
       z-index: 1000;
     }
     
@@ -606,7 +658,7 @@ const dashboardHTML = `<!DOCTYPE html>
     }
     
     .chat-title {
-      font-size: 14px;
+      font-size: 16px;
       font-weight: 600;
       display: flex;
       align-items: center;
@@ -636,10 +688,10 @@ const dashboardHTML = `<!DOCTYPE html>
     }
     
     .chat-bubble {
-      padding: 12px 16px;
+      padding: 14px 18px;
       border-radius: 12px;
-      font-size: 14px;
-      line-height: 1.5;
+      font-size: 15px;
+      line-height: 1.6;
     }
     
     .chat-input-wrapper {
@@ -653,9 +705,9 @@ const dashboardHTML = `<!DOCTYPE html>
       background: var(--bg-secondary);
       border: 1px solid var(--border);
       border-radius: 12px;
-      padding: 12px 50px 12px 16px;
+      padding: 16px 50px 16px 18px;
       color: var(--text-primary);
-      font-size: 14px;
+      font-size: 15px;
       font-family: inherit;
       outline: none;
       resize: none;
@@ -855,6 +907,7 @@ const dashboardHTML = `<!DOCTYPE html>
         <span id="netdataStatus">Connecting...</span>
       </div>
       <button class="btn btn-sm" onclick="refreshAll()">⟳ Refresh</button>
+      <button class="btn btn-sm btn-outline" onclick="toggleTheme()">🌓 Theme</button>
       <button class="btn btn-sm btn-outline" onclick="toggleChat()">💬 AI Chat</button>
     </div>
   </header>
@@ -918,18 +971,19 @@ const dashboardHTML = `<!DOCTYPE html>
     <div class="content">
       <!-- Tab Bar -->
       <div class="tabs">
-        <div class="tab active" data-tab="overview">Overview</div>
-        <div class="tab" data-tab="cpu">CPU</div>
-        <div class="tab" data-tab="memory">Memory</div>
-        <div class="tab" data-tab="network">Network</div>
-        <div class="tab" data-tab="disk">Disk I/O</div>
+        <div class="tab active" data-tab="overview">Project_1</div>
+        <div class="tab" data-tab="cpu">Project_2</div>
+        <div class="tab" data-tab="memory">Project_3</div>
+        <div class="tab" data-tab="network">Project_4</div>
+        <div class="tab" data-tab="disk">Project_5</div>
       </div>
 
-      <!-- Dashboard -->
+      <!-- VIEW: Overview (default) -->
+      <div id="view-overview" class="view-section" style="display: block;">
       <div class="dashboard" id="dashboardContent">
         <!-- Stats Row -->
         <div class="stats-row">
-          <div class="stat-card">
+          <div class="stat-card">                                                                   
             <div class="stat-label">CPU Usage</div>
             <div class="stat-value"><span id="cpuStat">--</span><span class="stat-unit">%</span></div>
             <div class="stat-trend up" id="cpuTrend">↑ 0.1%</div>
@@ -1067,6 +1121,87 @@ const dashboardHTML = `<!DOCTYPE html>
           </table>
         </div>
       </div>
+    </div><!-- End view-overview -->
+
+    <!-- VIEW: CPU Details -->
+    <div id="view-cpu" class="view-section" style="display: none;">
+      <div class="dashboard">
+        <!-- CPU Overview Stats -->
+        <div class="stats-row" style="grid-template-columns: repeat(4, 1fr);">
+          <div class="stat-card">
+            <div class="stat-label">Total CPU Usage</div>
+            <div class="stat-value"><span id="cpuViewTotal">--</span><span class="stat-unit">%</span></div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-label">Load (1m)</div>
+            <div class="stat-value" id="cpuViewLoad1">--</div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-label">Load (5m)</div>
+            <div class="stat-value" id="cpuViewLoad5">--</div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-label">Load (15m)</div>
+            <div class="stat-value" id="cpuViewLoad15">--</div>
+          </div>
+        </div>
+
+        <!-- CPU Components Grid -->
+        <div class="chart-card" style="margin-bottom: 24px;">
+          <div class="chart-header">
+            <div class="chart-title">🔢 CPU Breakdown</div>
+          </div>
+          <div id="cpu-cores-container" style="display: grid; grid-template-columns: repeat(auto-fill, minmax(100px, 1fr)); gap: 12px; padding: 16px;">
+            <div style="color: var(--text-muted); text-align: center; grid-column: 1/-1;">Loading...</div>
+          </div>
+        </div>
+
+        <!-- Charts Grid - Same as Overview -->
+        <div class="charts-grid">
+          <div class="chart-card">
+            <div class="chart-header">
+              <div class="chart-title">📈 CPU Usage (Last 60s)</div>
+            </div>
+            <div class="chart-container">
+              <canvas id="cpuViewChart" class="chart-canvas"></canvas>
+            </div>
+          </div>
+          
+          <div class="chart-card">
+            <div class="chart-header">
+              <div class="chart-title">📊 System Load</div>
+            </div>
+            <div class="chart-container">
+              <canvas id="cpuLoadChart" class="chart-canvas"></canvas>
+            </div>
+          </div>
+        </div>
+
+        <!-- Top Processes by CPU -->
+        <div class="chart-card" style="margin-top: 24px;">
+          <div class="chart-header">
+            <div class="chart-title">⚙️ Top Processes by CPU</div>
+            <button class="btn btn-sm" onclick="loadCPUProcesses()">Refresh</button>
+          </div>
+          <table class="process-table">
+            <thead>
+              <tr>
+                <th>PID</th>
+                <th>Process</th>
+                <th>CPU %</th>
+                <th>Usage</th>
+              </tr>
+            </thead>
+            <tbody id="cpuViewProcessBody">
+              <tr>
+                <td colspan="4" style="text-align: center; color: var(--text-muted);">Loading...</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div><!-- End view-cpu -->
+
     </div>
   </main>
 
@@ -1094,6 +1229,25 @@ const dashboardHTML = `<!DOCTYPE html>
   </div>
 
   <script>
+    // ==========================================
+    // DATA STORAGE
+    // ==========================================
+    // ==========================================
+    // THEME HANDLING
+    // ==========================================
+    function toggleTheme() {
+      const root = document.documentElement;
+      const current = root.getAttribute('data-theme');
+      const next = current === 'light' ? 'dark' : 'light';
+      root.setAttribute('data-theme', next);
+      localStorage.setItem('theme', next);
+      // Force chart update to pick up new colors
+      if (typeof updateCharts === 'function') updateCharts();
+    }
+    // Init theme
+    const savedTheme = localStorage.getItem('theme') || 'dark';
+    document.documentElement.setAttribute('data-theme', savedTheme);
+
     // ==========================================
     // DATA STORAGE
     // ==========================================
@@ -1125,8 +1279,16 @@ const dashboardHTML = `<!DOCTYPE html>
       const chartWidth = width - padding.left - padding.right;
       const chartHeight = height - padding.top - padding.bottom;
       
+      
+      // Get theme colors from body/root where data-theme is set
+      const style = getComputedStyle(document.documentElement);
+      const bgCard = style.getPropertyValue('--bg-card').trim() || (document.documentElement.getAttribute('data-theme') === 'light' ? '#ffffff' : '#171717');
+      const borderColor = style.getPropertyValue('--border').trim() || '#2d2d2d';
+      const textMuted = style.getPropertyValue('--text-muted').trim() || '#6b6b6b';
+      const textSecondary = style.getPropertyValue('--text-secondary').trim() || '#ababab';
+
       // Clear
-      ctx.fillStyle = '#171717';
+      ctx.fillStyle = bgCard;
       ctx.fillRect(0, 0, width, height);
       
       // Find max value
@@ -1139,7 +1301,7 @@ const dashboardHTML = `<!DOCTYPE html>
       maxVal = Math.ceil(maxVal * 1.1);
       
       // Draw grid
-      ctx.strokeStyle = '#2d2d2d';
+      ctx.strokeStyle = borderColor;
       ctx.lineWidth = 1;
       for (let i = 0; i <= 4; i++) {
         const y = padding.top + (chartHeight / 4) * i;
@@ -1149,7 +1311,7 @@ const dashboardHTML = `<!DOCTYPE html>
         ctx.stroke();
         
         // Y axis labels
-        ctx.fillStyle = '#6b6b6b';
+        ctx.fillStyle = textMuted;
         ctx.font = '11px JetBrains Mono';
         ctx.textAlign = 'right';
         const val = (maxVal - (maxVal / 4) * i).toFixed(0);
@@ -1164,7 +1326,10 @@ const dashboardHTML = `<!DOCTYPE html>
         ctx.lineWidth = 2;
         ctx.beginPath();
         
-        const step = chartWidth / (maxPoints - 1);
+        // Dynamic step based on data length to ensure it fills width
+        const points = ds.data.length > 1 ? ds.data.length : maxPoints;
+        const step = chartWidth / (points - 1);
+
         ds.data.forEach((val, i) => {
           const x = padding.left + i * step;
           const y = padding.top + chartHeight - (val / maxVal) * chartHeight;
@@ -1191,7 +1356,7 @@ const dashboardHTML = `<!DOCTYPE html>
         datasets.forEach(ds => {
           ctx.fillStyle = ds.color;
           ctx.fillRect(legendX, height - 15, 12, 3);
-          ctx.fillStyle = '#ababab';
+          ctx.fillStyle = textSecondary;
           ctx.font = '11px Inter';
           ctx.textAlign = 'left';
           ctx.fillText(ds.label, legendX + 16, height - 11);
@@ -1668,16 +1833,6 @@ const dashboardHTML = `<!DOCTYPE html>
     refreshPendingActions();
     setInterval(refreshPendingActions, 5000);
 
-    function showTab(tab) {
-      // Update nav
-      document.querySelectorAll('.nav-item').forEach(el => el.classList.remove('active'));
-      event.target.closest('.nav-item').classList.add('active');
-      
-      // Update tab bar
-      document.querySelectorAll('.tab').forEach(el => {
-        el.classList.toggle('active', el.dataset.tab === tab);
-      });
-    }
 
     // ==========================================
     // MAIN LOOP
@@ -1719,6 +1874,157 @@ const dashboardHTML = `<!DOCTYPE html>
     setInterval(mainLoop, 1000);
     setInterval(fetchAlerts, 5000);
     setInterval(fetchProcesses, 3001);
+
+    // ==========================================
+    // VIEW SWITCHING
+    // ==========================================
+    let currentView = 'overview';
+    
+    function showTab(viewId) {
+      // Hide all views
+      document.querySelectorAll('.view-section').forEach(el => el.style.display = 'none');
+      
+      // Show selected view
+      const viewEl = document.getElementById('view-' + viewId);
+      if (viewEl) viewEl.style.display = 'flex';
+      
+      // Update nav active state
+      document.querySelectorAll('.nav-item').forEach(el => el.classList.remove('active'));
+      if (event && event.target) {
+        event.target.closest('.nav-item').classList.add('active');
+      }
+      
+      currentView = viewId;
+      
+      // Load view-specific data
+      if (viewId === 'cpu') loadCPUView();
+    }
+
+    // ==========================================
+    // CPU VIEW DATA LOADING
+    // ==========================================
+    let cpuViewData = { cpu: [] };
+    let cpuCoresList = [];
+    
+    async function loadCPUView() {
+      // Load aggregate CPU data
+      try {
+        const cpuRes = await fetch('/api/chart/system.cpu?after=-60&points=60');
+        const cpuData = await cpuRes.json();
+        if (cpuData.data) {
+          cpuViewData.cpu = cpuData.data.map(row => {
+            const values = row.slice(1);
+            return values.reduce((a, b) => a + b, 0);
+          }).reverse();
+          
+          const latest = cpuViewData.cpu[cpuViewData.cpu.length - 1] || 0;
+          document.getElementById('cpuViewTotal').textContent = latest.toFixed(1);
+          
+          // Draw CPU chart
+          drawChart('cpuViewChart', [
+            { label: 'CPU %', data: cpuViewData.cpu, color: '#10a37f' }
+          ], { unit: '%', maxY: 100 });
+        }
+      } catch (e) { console.error('CPU view fetch error:', e); }
+      
+      // Load system load (stats + chart)
+      try {
+        const loadRes = await fetch('/api/chart/system.load?after=-60&points=60');
+        const loadData = await loadRes.json();
+        if (loadData.data && loadData.data.length > 0) {
+          // Update stats from latest value
+          const latest = loadData.data[0];
+          document.getElementById('cpuViewLoad1').textContent = (latest[1] || 0).toFixed(2);
+          document.getElementById('cpuViewLoad5').textContent = (latest[2] || 0).toFixed(2);
+          document.getElementById('cpuViewLoad15').textContent = (latest[3] || 0).toFixed(2);
+          
+          // Draw load chart
+          const load1 = loadData.data.map(row => row[1] || 0).reverse();
+          const load5 = loadData.data.map(row => row[2] || 0).reverse();
+          const load15 = loadData.data.map(row => row[3] || 0).reverse();
+          
+          drawChart('cpuLoadChart', [
+            { label: '1m', data: load1, color: '#10a37f' },
+            { label: '5m', data: load5, color: '#43a9ff' },
+            { label: '15m', data: load15, color: '#f5a623' }
+          ]);
+        }
+      } catch (e) {}
+      
+      // Load per-core data
+      await loadCPUCores();
+      
+      // Load processes
+      await loadCPUProcesses();
+    }
+    
+    async function loadCPUCores() {
+      const container = document.getElementById('cpu-cores-container');
+      if (!container) return;
+      
+      try {
+        // Use system.cpu breakdown as CPU components
+        const cpuRes = await fetch('/api/chart/system.cpu?after=-1&points=1');
+        const cpuData = await cpuRes.json();
+        
+        if (!cpuData.labels || !cpuData.data || !cpuData.data[0]) {
+          container.innerHTML = '<div style="color: var(--text-muted); text-align: center; grid-column: 1/-1;">No CPU component data</div>';
+          return;
+        }
+        
+        const labels = cpuData.labels.slice(1); // Skip 'time'
+        const values = cpuData.data[0].slice(1);
+        
+        container.innerHTML = '';
+        
+        for (var i = 0; i < labels.length; i++) {
+          var label = labels[i];
+          var value = values[i] || 0;
+          
+          if (value < 0.01) continue; // Skip zero values
+          
+          var card = document.createElement('div');
+          card.style.cssText = 'background: var(--bg-secondary); border: 1px solid var(--border); border-radius: 8px; padding: 12px; text-align: center;';
+          card.innerHTML = '<div style="font-size: 12px; color: var(--text-muted); margin-bottom: 4px; text-transform: capitalize;">' + label + '</div><div style="font-size: 20px; font-weight: 600; color: var(--text-primary);">' + value.toFixed(1) + '%</div>';
+          container.appendChild(card);
+        }
+        
+        if (container.children.length === 0) {
+          container.innerHTML = '<div style="color: var(--text-muted); text-align: center; grid-column: 1/-1;">CPU idle</div>';
+        }
+      } catch (e) {
+        container.innerHTML = '<div style="color: var(--error); text-align: center; grid-column: 1/-1;">Error loading CPU data</div>';
+      }
+    }
+    
+    async function loadCPUProcesses() {
+      const tbody = document.getElementById('cpuViewProcessBody');
+      if (!tbody) return;
+      
+      try {
+        // Use ps-based API endpoint for actual process data
+        const res = await fetch('/api/processes');
+        const data = await res.json();
+        
+        if (data.processes && data.processes.length > 0) {
+          tbody.innerHTML = data.processes.map(function(p) {
+            var barWidth = Math.min(p.cpu, 100);
+            var barColor = p.cpu > 50 ? 'var(--warning)' : 'var(--accent)';
+            var cmdDisplay = p.command.length > 30 ? p.command.substring(0, 30) + '...' : p.command;
+            return '<tr><td style="font-family: JetBrains Mono, monospace; color: var(--accent);">' + p.pid + '</td><td class="process-name">' + cmdDisplay + '</td><td>' + p.cpu.toFixed(1) + '%</td><td><div class="process-bar"><div class="process-bar-fill" style="width: ' + barWidth + '%; background: ' + barColor + '"></div></div></td></tr>';
+          }).join('');
+        } else {
+          tbody.innerHTML = '<tr><td colspan="4" style="text-align: center; color: var(--text-muted);">No process data</td></tr>';
+        }
+      } catch (e) {
+        tbody.innerHTML = '<tr><td colspan="4" style="text-align: center; color: var(--error);">Error loading processes</td></tr>';
+      }
+    }
+    
+    // Auto-refresh CPU view if active
+    setInterval(() => {
+      if (currentView === 'cpu') loadCPUView();
+    }, 2000);
   </script>
 </body>
 </html>
