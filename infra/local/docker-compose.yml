@@ -1,36 +1,34 @@
+version: "3.9"
+
 services:
+  # ==========================================
+  # Netdata - System Monitoring
+  # ==========================================
   netdata:
-    # Use GHCR to avoid Docker Hub IPv6/CDN issues
     image: ghcr.io/netdata/netdata:latest
     container_name: netdata
     ports:
       - "19999:19999"
-
-    # Required for deep Linux metrics
     cap_add:
       - SYS_PTRACE
       - SYS_ADMIN
-
     security_opt:
       - apparmor:unconfined
-
     volumes:
-      # Persistent Netdata data
       - netdataconfig:/etc/netdata
       - netdatalib:/var/lib/netdata
       - netdatacache:/var/cache/netdata
-
-      # Linux host metrics (NOT for macOS)
       - /proc:/host/proc:ro
       - /sys:/host/sys:ro
       - /etc/os-release:/host/etc/os-release:ro
-
     environment:
       - NETDATA_EXTRA_DEB_PACKAGES=python3-pip
-
     restart: unless-stopped
 
-  postgres:
+  # ==========================================
+  # Postgres Database
+  # ==========================================
+  aiops-db:
     image: postgres:15-alpine
     container_name: aiops-db
     ports:
@@ -43,29 +41,45 @@ services:
       - pgdata:/var/lib/postgresql/data
     restart: unless-stopped
 
+  # ==========================================
+  # Peekaping - AIOps Dashboard
+  # ==========================================
+  peekaping:
+    image: 0xfurai/peekaping-bundle-postgres:latest
+    container_name: peekaping
+    ports:
+      - "3002:8034"
+      - "3003:8383"
+    environment:
+      DB_USER: aiops
+      DB_PASS: aiops_password
+      DB_HOST: aiops-db
+      DB_PORT: 5432
+      DB_NAME: peekaping
+    depends_on:
+      - aiops-db
+    restart: unless-stopped
+
+  # ==========================================
+  # Ansible-EDA
+  # ==========================================
   ansible-eda:
     image: quay.io/ansible/ansible-rulebook:latest
     container_name: aiops-eda
     ports:
       - "5000:5000"
-
     volumes:
       - ../../apps/automation/playbooks:/playbooks:ro
       - ../../apps/automation/rules:/rules:ro
       - ../../apps/automation/inventory:/inventory:ro
-
     working_dir: /rules
-
     command: >
       ansible-rulebook
       --rulebook aiops_rulebook.yml
       -i /inventory/hosts.yml
       --verbose
-
-    # Linux-safe replacement for macOS host access
     extra_hosts:
       - "host.docker.internal:host-gateway"
-
     restart: unless-stopped
 
 volumes:
