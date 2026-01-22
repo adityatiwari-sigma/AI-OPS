@@ -19,6 +19,9 @@ from openai import OpenAI
 # Database
 import asyncpg
 
+# Monitoring Service
+from monitoring_service import metrics_collector
+
 app = FastAPI(title="AIOps Brain", version="3.0.0")
 
 # CORS for frontend
@@ -471,12 +474,44 @@ class ApprovalRequest(BaseModel):
 
 
 # ============================================================================
+# BACKGROUND MONITORING
+# ============================================================================
+
+async def run_metrics_collection():
+    """Background task to periodically collect all metrics"""
+    await asyncio.sleep(5)  # Wait for services to be ready
+    while True:
+        try:
+            # Collect all 6 categories of metrics
+            await metrics_collector.collect_availability_metrics()
+            await asyncio.sleep(1)
+            await metrics_collector.collect_performance_metrics()
+            await asyncio.sleep(1)
+            await metrics_collector.collect_database_metrics()
+            await asyncio.sleep(1)
+            await metrics_collector.collect_infrastructure_metrics()
+            await asyncio.sleep(1)
+            await metrics_collector.collect_application_metrics()
+            await asyncio.sleep(1)
+            await metrics_collector.collect_incident_metrics()
+            
+            # Wait before next round (collect every 30 seconds)
+            await asyncio.sleep(24)
+        except Exception as e:
+            print(f"Metrics collection error: {e}")
+            await asyncio.sleep(30)
+
+
+# ============================================================================
 # API ENDPOINTS
 # ============================================================================
 
 @app.on_event("startup")
 async def startup():
     await init_db()
+    await metrics_collector.initialize()
+    # Start background metrics collection
+    asyncio.create_task(run_metrics_collection())
 
 
 @app.get("/")
@@ -879,6 +914,84 @@ async def get_audit_log(limit: int = 50):
             print(f"DB error: {e}")
     
     return {"logs": []}
+
+
+# ============================================================================
+# METRICS ENDPOINTS - New comprehensive monitoring
+# ============================================================================
+
+@app.get("/api/metrics/summary")
+async def get_metrics_summary():
+    """Get summary of all metrics categories"""
+    return await metrics_collector.get_all_metrics_summary()
+
+
+@app.get("/api/metrics/availability")
+async def get_availability_metrics():
+    """Get availability and uptime metrics"""
+    return await metrics_collector.collect_availability_metrics()
+
+
+@app.get("/api/metrics/performance")
+async def get_performance_metrics():
+    """Get performance metrics (page load, 5xx errors, error rate)"""
+    return await metrics_collector.collect_performance_metrics()
+
+
+@app.get("/api/metrics/database")
+async def get_database_metrics():
+    """Get database performance metrics"""
+    return await metrics_collector.collect_database_metrics()
+
+
+@app.get("/api/metrics/infrastructure")
+async def get_infrastructure_metrics():
+    """Get enhanced infrastructure metrics with threshold alerts"""
+    return await metrics_collector.collect_infrastructure_metrics()
+
+
+@app.get("/api/metrics/application")
+async def get_application_metrics():
+    """Get application error logs and metrics"""
+    return await metrics_collector.collect_application_metrics()
+
+
+@app.get("/api/metrics/incidents")
+async def get_incident_metrics():
+    """Get incident tracking and service failure metrics"""
+    return await metrics_collector.collect_incident_metrics()
+
+
+@app.get("/api/metrics/alerts")
+async def get_metrics_alerts():
+    """Get all active threshold-based alerts"""
+    return {"alerts": await metrics_collector.get_active_alerts()}
+
+
+@app.post("/api/metrics/alerts/{alert_id}/acknowledge")
+async def acknowledge_metric_alert(alert_id: str, acknowledged_by: str = "admin"):
+    """Acknowledge a metric alert"""
+    await metrics_collector.acknowledge_alert(alert_id, acknowledged_by)
+    return {"status": "acknowledged", "alert_id": alert_id}
+
+
+@app.post("/api/metrics/alerts/{alert_id}/resolve")
+async def resolve_metric_alert(alert_id: str):
+    """Mark a metric alert as resolved"""
+    await metrics_collector.resolve_alert(alert_id)
+    return {"status": "resolved", "alert_id": alert_id}
+
+
+@app.post("/api/metrics/errors/log")
+async def log_application_error(
+    error_type: str,
+    error_message: str,
+    stack_trace: Optional[str] = None,
+    context: Optional[Dict] = None
+):
+    """Log an application error for tracking"""
+    await metrics_collector.log_error(error_type, error_message, stack_trace, context)
+    return {"logged": True}
 
 
 @app.websocket("/ws")

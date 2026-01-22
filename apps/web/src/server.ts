@@ -1381,7 +1381,7 @@ const dashboardHTML = `<!DOCTYPE html>
           const latest = chartData.cpu[chartData.cpu.length - 1] || 0;
           document.getElementById('cpuStat').textContent = latest.toFixed(1);
         }
-      } catch (e) {}
+      }catch (e) {}
     }
 
     async function fetchMemory() {
@@ -1399,7 +1399,7 @@ const dashboardHTML = `<!DOCTYPE html>
           const latest = chartData.mem[chartData.mem.length - 1] || 0;
           document.getElementById('memStat').textContent = latest.toFixed(1);
         }
-      } catch (e) {}
+      }catch (e) {}
     }
 
     async function fetchNetwork() {
@@ -1415,7 +1415,7 @@ const dashboardHTML = `<!DOCTYPE html>
           document.getElementById('netInStat').textContent = formatBytes(latestIn * 1024);
           document.getElementById('netOutStat').textContent = formatBytes(latestOut * 1024);
         }
-      } catch (e) {}
+      }catch (e) {}
     }
 
     async function fetchDiskIO() {
@@ -1430,7 +1430,7 @@ const dashboardHTML = `<!DOCTYPE html>
           const latestWrite = chartData.disk.write[chartData.disk.write.length - 1] || 0;
           document.getElementById('diskIOStat').textContent = formatBytes((latestRead + latestWrite) * 1024);
         }
-      } catch (e) {}
+      }catch (e) {}
     }
 
     async function fetchLoad() {
@@ -1445,7 +1445,7 @@ const dashboardHTML = `<!DOCTYPE html>
           const latest = chartData.load.load1[chartData.load.load1.length - 1] || 0;
           document.getElementById('loadStat').textContent = latest.toFixed(2);
         }
-      } catch (e) {}
+      }catch (e) {}
     }
 
     async function fetchAlerts() {
@@ -1461,19 +1461,19 @@ const dashboardHTML = `<!DOCTYPE html>
         
         if (alerts.length === 0) {
           list.innerHTML = '<div class="alert-row" style="justify-content: center; color: var(--accent);">✓ All systems normal</div>';
-        } else {
+        }else {
           list.innerHTML = alerts.map(a => \`
             <div class="alert-row">
               <div class="alert-severity \${a.status === 'CRITICAL' ? 'critical' : 'warning'}"></div>
               <div class="alert-content">
                 <div class="alert-name">\${a.name}</div>
-                <div class="alert-meta">\${a.chart} • \${a.status}</div>
+                <div class="alert-meta">\${a.chart}• \${a.status}</div>
               </div>
               <button class="btn btn-sm" onclick="diagnoseAlert('\${a.name}')">Diagnose</button>
             </div>
           \`).join('');
         }
-      } catch (e) {
+      }catch (e) {
         console.error('Alerts fetch error:', e);
         list.innerHTML = '<div class="alert-row" style="justify-content: center; color: var(--error);">⚠ Failed to load alerts</div>';
         document.getElementById('alertsCount').textContent = '?';
@@ -1492,7 +1492,7 @@ const dashboardHTML = `<!DOCTYPE html>
         const hours = Math.floor(uptime / 3600);
         const mins = Math.floor((uptime % 3600) / 60);
         document.getElementById('uptimeValue').textContent = \`\${hours}h \${mins}m\`;
-      } catch (e) {
+      }catch (e) {
         document.getElementById('netdataStatus').textContent = 'Disconnected';
       }
     }
@@ -1503,7 +1503,7 @@ const dashboardHTML = `<!DOCTYPE html>
         const data = await res.json();
         const count = Object.keys(data.charts || {}).length;
         document.getElementById('chartsCount').textContent = count;
-      } catch (e) {}
+      }catch (e) {}
     }
 
     async function fetchProcesses() {
@@ -1530,7 +1530,7 @@ const dashboardHTML = `<!DOCTYPE html>
             </tr>
           \`).join('');
         }
-      } catch (e) {}
+      }catch (e) {}
     }
 
     // ==========================================
@@ -1580,10 +1580,10 @@ const dashboardHTML = `<!DOCTYPE html>
           slashMenu.querySelectorAll('.slash-item').forEach(el => {
             el.onclick = () => selectSlash(filtered[parseInt(el.dataset.i)]);
           });
-        } else {
+        }else {
           slashMenu.classList.remove('visible');
         }
-      } else {
+      }else {
         slashMenu.classList.remove('visible');
         selectedIdx = 0;
       }
@@ -1595,19 +1595,19 @@ const dashboardHTML = `<!DOCTYPE html>
           e.preventDefault();
           selectedIdx = Math.min(selectedIdx + 1, filtered.length - 1);
           chatInput.dispatchEvent(new Event('input'));
-        } else if (e.key === 'ArrowUp') {
+        }else if (e.key === 'ArrowUp') {
           e.preventDefault();
           selectedIdx = Math.max(selectedIdx - 1, 0);
           chatInput.dispatchEvent(new Event('input'));
-        } else if (e.key === 'Enter' || e.key === 'Tab') {
+        }else if (e.key === 'Enter' || e.key === 'Tab') {
           if (filtered.length > 0) {
             e.preventDefault();
             selectSlash(filtered[selectedIdx]);
           }
-        } else if (e.key === 'Escape') {
+        }else if (e.key === 'Escape') {
           slashMenu.classList.remove('visible');
         }
-      } else if (e.key === 'Enter' && !e.shiftKey) {
+      }else if (e.key === 'Enter' && !e.shiftKey) {
         e.preventDefault();
         sendMessage();
       }
@@ -1644,7 +1644,7 @@ const dashboardHTML = `<!DOCTYPE html>
           content = '<div style="margin-bottom: 8px; font-size: 11px; color: var(--text-muted);">Tools: ' + data.tools_used.join(', ') + '</div>' + content;
         }
         addChatMessage(content, false);
-      } catch (e) {
+      }catch (e) {
         removeTyping(typingId);
         addChatMessage('Error connecting to AI Brain', false);
       }
@@ -1733,7 +1733,7 @@ const dashboardHTML = `<!DOCTYPE html>
         
         if (actions.length === 0) {
           container.innerHTML = '<div class="alert-row" style="justify-content: center; color: var(--text-muted);">No pending actions - all clear! ✓</div>';
-        } else {
+        }else {
           container.innerHTML = actions.map(a => \`
             <div style="padding: 16px; border-bottom: 1px solid var(--border);">
               <div style="display: flex; justify-content: space-between; align-items: start; margin-bottom: 12px;">
@@ -1742,7 +1742,7 @@ const dashboardHTML = `<!DOCTYPE html>
                     \${a.action_type.replace('_', ' ').toUpperCase()}
                   </div>
                   <div style="font-size: 12px; color: var(--text-muted);">
-                    Target: \${a.target} | Severity: <span style="color: \${a.severity === 'CRITICAL' ? 'var(--error)' : a.severity === 'HIGH' ? 'var(--warning)' : 'var(--accent)'};">\${a.severity}</span>
+                    Target: \${a.target}| Severity: <span style="color: \${a.severity === 'CRITICAL' ? 'var(--error)' : a.severity === 'HIGH' ? 'var(--warning)' : 'var(--accent)'};">\${a.severity}</span>
                   </div>
                 </div>
                 <div style="font-size: 11px; color: var(--text-muted);">
@@ -1765,7 +1765,7 @@ const dashboardHTML = `<!DOCTYPE html>
             </div>
           \`).join('');
         }
-      } catch (e) {
+      }catch (e) {
         console.error('Pending actions error:', e);
       }
     }
@@ -1785,7 +1785,7 @@ const dashboardHTML = `<!DOCTYPE html>
         
         // Refresh pending actions
         refreshPendingActions();
-      } catch (e) {
+      }catch (e) {
         console.error('Approval error:', e);
       }
     }
@@ -1802,7 +1802,7 @@ const dashboardHTML = `<!DOCTYPE html>
         addChatMessage('❌ Action rejected: ' + data.message, false);
         document.getElementById('chatPanel').style.display = 'flex';
         refreshPendingActions();
-      } catch (e) {
+      }catch (e) {
         console.error('Rejection error:', e);
       }
     }
@@ -1818,12 +1818,12 @@ const dashboardHTML = `<!DOCTYPE html>
             refreshPendingActions();
             // Flash notification
             document.getElementById('pendingCount').style.animation = 'pulse 0.5s 3';
-          } else if (data.type === 'action_resolved') {
+          }else if (data.type === 'action_resolved') {
             refreshPendingActions();
           }
         };
         ws.onclose = () => setTimeout(connectWebSocket, 3001);
-      } catch (e) {
+      }catch (e) {
         console.log('WebSocket not available');
       }
     }
@@ -1925,7 +1925,7 @@ const dashboardHTML = `<!DOCTYPE html>
             { label: 'CPU %', data: cpuViewData.cpu, color: '#10a37f' }
           ], { unit: '%', maxY: 100 });
         }
-      } catch (e) { console.error('CPU view fetch error:', e); }
+      }catch (e) { console.error('CPU view fetch error:', e); }
       
       // Load system load (stats + chart)
       try {
@@ -1949,7 +1949,7 @@ const dashboardHTML = `<!DOCTYPE html>
             { label: '15m', data: load15, color: '#f5a623' }
           ]);
         }
-      } catch (e) {}
+      }catch (e) {}
       
       // Load per-core data
       await loadCPUCores();
@@ -1992,7 +1992,7 @@ const dashboardHTML = `<!DOCTYPE html>
         if (container.children.length === 0) {
           container.innerHTML = '<div style="color: var(--text-muted); text-align: center; grid-column: 1/-1;">CPU idle</div>';
         }
-      } catch (e) {
+      }catch (e) {
         container.innerHTML = '<div style="color: var(--error); text-align: center; grid-column: 1/-1;">Error loading CPU data</div>';
       }
     }
@@ -2013,10 +2013,10 @@ const dashboardHTML = `<!DOCTYPE html>
             var cmdDisplay = p.command.length > 30 ? p.command.substring(0, 30) + '...' : p.command;
             return '<tr><td style="font-family: JetBrains Mono, monospace; color: var(--accent);">' + p.pid + '</td><td class="process-name">' + cmdDisplay + '</td><td>' + p.cpu.toFixed(1) + '%</td><td><div class="process-bar"><div class="process-bar-fill" style="width: ' + barWidth + '%; background: ' + barColor + '"></div></div></td></tr>';
           }).join('');
-        } else {
+        }else {
           tbody.innerHTML = '<tr><td colspan="4" style="text-align: center; color: var(--text-muted);">No process data</td></tr>';
         }
-      } catch (e) {
+      }catch (e) {
         tbody.innerHTML = '<tr><td colspan="4" style="text-align: center; color: var(--error);">Error loading processes</td></tr>';
       }
     }

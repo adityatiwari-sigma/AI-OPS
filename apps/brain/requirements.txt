@@ -10,3 +10,4 @@ python-dotenv
 openai
 langgraph
 asyncpg
+aiohttp>=3.9.0
