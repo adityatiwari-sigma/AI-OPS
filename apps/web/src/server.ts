@@ -43,13 +43,64 @@ app.get('/api/chart/:chart', async (c) => {
 })
 
 // API: Get active alerts from Netdata
+// API: Get Alerts (Active + History)
 app.get('/api/alerts', async (c) => {
   try {
-    const response = await fetch('http://localhost:19999/api/v1/alarms?active')
+    // Call Brain service for consolidated alerts
+    const response = await fetch('http://localhost:8000/api/active-alerts')
     const data = await response.json()
     return c.json(data)
   } catch (error) {
-    return c.json({ error: 'Failed to fetch alerts' }, 500)
+    return c.json({ error: 'Failed to fetch alerts', active: [], history: [] }, 500)
+  }
+})
+
+// API: Diagnose Alert
+app.post('/api/alerts/:id/diagnose', async (c) => {
+  try {
+    const body = await c.req.json()
+    const response = await fetch('http://localhost:8000/api/diagnose-alert', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body)
+    })
+    const data = await response.json()
+    return c.json(data)
+  } catch (error) {
+    return c.json({ error: 'Diagnosis failed' }, 500)
+  }
+})
+
+// API: Approve Remediation (Create Incident)
+app.post('/api/alerts/:id/approve', async (c) => {
+  try {
+    const body = await c.req.json()
+    const response = await fetch('http://localhost:8000/api/create-incident', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        title: `Alert Remediation: ${body.metric_name}`,
+        description: `User approved remediation for alert ${body.alert_id}`,
+        severity: body.severity || "MEDIUM",
+        alert_id: body.alert_id,
+        remediation_plan: body.remediation
+      })
+    })
+    const data = await response.json()
+    return c.json(data)
+  } catch (error) {
+    return c.json({ error: 'Failed to approve remediation' }, 500)
+  }
+})
+
+// API: Reject Remediation
+app.post('/api/alerts/:id/reject', async (c) => {
+  try {
+    // For now just acknowledge the alert? Or log rejection?
+    // We'll just return success for UI feedback
+    return c.json({ status: "rejected" })
+  } catch (error) {
+    return c.json({ error: 'Failed to reject' }, 500)
   }
 })
 
@@ -67,7 +118,9 @@ app.get('/api/info', async (c) => {
 // API: Get Top Processes using ps command
 app.get('/api/processes', async (c) => {
   try {
-    const proc = Bun.spawn(['ps', 'aux', '--sort=-%cpu']);
+    const sortBy = c.req.query('sort') || 'cpu';
+    const sortFlag = sortBy === 'memory' ? '-%mem' : '-%cpu';
+    const proc = Bun.spawn(['ps', 'aux', `--sort=${sortFlag}`]);
     const output = await new Response(proc.stdout).text();
     const lines = output.trim().split('\n');
 
@@ -78,7 +131,7 @@ app.get('/api/processes', async (c) => {
         user: parts[0],
         pid: parts[1],
         cpu: parseFloat(parts[2]) || 0,
-        mem: parseFloat(parts[3]) || 0,
+        memory: parseFloat(parts[3]) || 0,
         command: parts.slice(10).join(' ').substring(0, 50)
       };
     });
@@ -86,6 +139,61 @@ app.get('/api/processes', async (c) => {
     return c.json({ processes });
   } catch (error) {
     return c.json({ error: 'Failed to fetch processes', processes: [] }, 500);
+  }
+})
+
+// API: Get Top Disk Usage Directories
+app.get('/api/disk-usage', async (c) => {
+  try {
+    // Get total disk space first (use shell to avoid permission issues)
+    const dfProc = Bun.spawn(['sh', '-c', 'df -B1 / | tail -1']);
+    const dfOutput = await new Response(dfProc.stdout).text();
+    await dfProc.exited;
+
+    let totalDiskBytes = 500000000000; // Default 500GB
+    const dfParts = dfOutput.trim().split(/\s+/);
+    if (dfParts.length > 1) {
+      totalDiskBytes = parseInt(dfParts[1]) || 500000000000;
+    }
+
+    // Get top directories (use shell with error suppression)
+    const proc = Bun.spawn(['sh', '-c', 'du -h --max-depth=1 /home /var /usr /opt 2>/dev/null | sort -h -r | head -20']);
+    const output = await new Response(proc.stdout).text();
+    await proc.exited;
+
+    const lines = output.trim().split('\n').filter(l => l.length > 0);
+
+    const directories = lines.map((line, idx) => {
+      const parts = line.trim().split(/\s+/);
+      const size = parts[0] || '0';
+      const path = parts[1] || '/';
+
+      // Parse human-readable size to bytes
+      let sizeBytes = 0;
+      const match = size.match(/^([\d.]+)([KMGT]?)$/i);
+      if (match) {
+        const num = parseFloat(match[1]);
+        const unit = (match[2] || '').toUpperCase();
+        const multipliers: Record<string, number> = { '': 1, 'K': 1024, 'M': 1048576, 'G': 1073741824, 'T': 1099511627776 };
+        sizeBytes = num * (multipliers[unit] || 1);
+      }
+
+      return { idx: idx + 1, path, size, sizeBytes };
+    });
+
+    // Take top 10 (already sorted by shell command)
+    const top = directories.slice(0, 10);
+
+    // Calculate percentage based on TOTAL disk space
+    const withPercent = top.map(d => ({
+      ...d,
+      percent: ((d.sizeBytes / totalDiskBytes) * 100).toFixed(1)
+    }));
+
+    return c.json({ directories: withPercent, totalDiskBytes });
+  } catch (error) {
+    console.error('Disk usage API error:', error);
+    return c.json({ error: String(error), directories: [] }, 500);
   }
 })
 
@@ -144,6 +252,36 @@ app.get('/api/audit-log', async (c) => {
     return c.json(data)
   } catch (error) {
     return c.json({ logs: [] })
+  }
+})
+
+// API: Get network packets
+app.get('/api/network/packets', async (c) => {
+  try {
+    const limit = c.req.query('limit') || '50'
+    const response = await fetch(`http://localhost:8000/api/network/packets?limit=${limit}`)
+    const data = await response.json()
+    return c.json(data)
+  } catch (error) {
+    return c.json({ packets: [], count: 0, error: 'Network sniffer not available' })
+  }
+})
+
+// API: Get network stats
+app.get('/api/network/stats', async (c) => {
+  try {
+    const response = await fetch('http://localhost:8000/api/network/stats')
+    const data = await response.json()
+    return c.json(data)
+  } catch (error) {
+    return c.json({
+      total_packets: 0,
+      packets_per_second: 0,
+      suspicious_count: 0,
+      protocols: {},
+      is_running: false,
+      scapy_available: false
+    })
   }
 })
 
@@ -939,10 +1077,6 @@ const dashboardHTML = `<!DOCTYPE html>
           <span class="nav-icon">🌐</span>
           <span>Network</span>
         </div>
-        <div class="nav-item" onclick="showTab('processes')">
-          <span class="nav-icon">⚙️</span>
-          <span>Processes</span>
-        </div>
         <div class="nav-item" onclick="showTab('alerts')">
           <span class="nav-icon">🚨</span>
           <span>Alerts</span>
@@ -1202,7 +1336,292 @@ const dashboardHTML = `<!DOCTYPE html>
       </div>
     </div><!-- End view-cpu -->
 
-    </div>
+    <!-- VIEW: Memory Details -->
+    <div id="view-memory" class="view-section" style="display: none;">
+      <div class="dashboard">
+        <!-- Memory Overview Stats -->
+        <div class="stats-row" style="grid-template-columns: repeat(4, 1fr);">
+          <div class="stat-card">
+            <div class="stat-label">Total Memory</div>
+            <div class="stat-value" id="memViewTotal">--</div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-label">Used Memory</div>
+            <div class="stat-value"><span id="memViewUsed">--</span><span class="stat-unit">%</span></div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-label">Swap Total</div>
+            <div class="stat-value" id="memViewSwapTotal">--</div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-label">Swap Used</div>
+            <div class="stat-value"><span id="memViewSwapUsed">--</span><span class="stat-unit">%</span></div>
+          </div>
+        </div>
+
+        <!-- Memory Breakdown -->
+        <div class="chart-card" style="margin-bottom: 24px;">
+          <div class="chart-header">
+            <div class="chart-title">🔢 Memory Breakdown</div>
+          </div>
+          <div id="memory-breakdown-container" style="display: grid; grid-template-columns: repeat(auto-fill, minmax(120px, 1fr)); gap: 12px; padding: 16px;">
+            <div style="color: var(--text-muted); text-align: center; grid-column: 1/-1;">Loading...</div>
+          </div>
+        </div>
+
+        <!-- Charts Grid -->
+        <div class="charts-grid">
+          <div class="chart-card">
+            <div class="chart-header">
+              <div class="chart-title">📈 Memory Usage (Last 60s)</div>
+            </div>
+            <div class="chart-container">
+              <canvas id="memViewChart" class="chart-canvas"></canvas>
+            </div>
+          </div>
+          
+          <div class="chart-card">
+            <div class="chart-header">
+              <div class="chart-title">📊 Swap Usage (Last 60s)</div>
+            </div>
+            <div class="chart-container">
+              <canvas id="swapViewChart" class="chart-canvas"></canvas>
+            </div>
+          </div>
+        </div>
+
+        <!-- Top Processes by Memory -->
+        <div class="chart-card" style="margin-top: 24px;">
+          <div class="chart-header">
+            <div class="chart-title">🧠 Top Processes by Memory</div>
+            <button class="btn btn-sm" onclick="loadMemoryProcesses()">Refresh</button>
+          </div>
+          <table class="process-table">
+            <thead>
+              <tr>
+                <th>PID</th>
+                <th>Process</th>
+                <th>Memory %</th>
+                <th>Usage</th>
+              </tr>
+            </thead>
+            <tbody id="memViewProcessBody">
+              <tr>
+                <td colspan="4" style="text-align: center; color: var(--text-muted);">Loading...</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div><!-- End view-memory -->
+
+    <!-- VIEW: Disk Details -->
+    <div id="view-disk" class="view-section" style="display: none;">
+      <div class="dashboard">
+        <!-- Disk Overview Stats -->
+        <div class="stats-row" style="grid-template-columns: repeat(4, 1fr);">
+          <div class="stat-card">
+            <div class="stat-label">Total Size</div>
+            <div class="stat-value" id="diskViewTotal">--</div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-label">Used Capacity</div>
+            <div class="stat-value" id="diskViewUsed">--</div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-label">Available Space</div>
+            <div class="stat-value" id="diskViewAvail">--</div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-label">Usage</div>
+            <div class="stat-value"><span id="diskViewPercent">--</span><span class="stat-unit">%</span></div>
+          </div>
+        </div>
+
+        <!-- Charts Grid -->
+        <div class="charts-grid">
+          <div class="chart-card">
+            <div class="chart-header">
+              <div class="chart-title">📈 Disk I/O (Last 60s)</div>
+            </div>
+            <div class="chart-container">
+              <canvas id="diskIOChart" class="chart-canvas"></canvas>
+            </div>
+          </div>
+          
+          <div class="chart-card">
+            <div class="chart-header">
+              <div class="chart-title">📊 Disk Space Usage</div>
+            </div>
+            <div class="chart-container">
+              <canvas id="diskSpaceChart" class="chart-canvas"></canvas>
+            </div>
+          </div>
+        </div>
+
+        <!-- Disk Usage Breakdown -->
+        <div class="chart-card" style="margin-top: 24px; margin-bottom: 24px;">
+          <div class="chart-header">
+            <div class="chart-title">🔢 Disk Space Breakdown</div>
+          </div>
+          <div id="disk-breakdown-container" style="display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 12px; padding: 16px;">
+            <div style="color: var(--text-muted); text-align: center; grid-column: 1/-1;">Loading...</div>
+          </div>
+        </div>
+
+        <!-- Top Directories by Disk Usage -->
+        <div class="chart-card" style="margin-top: 24px;">
+          <div class="chart-header">
+            <div class="chart-title">📁 Top Directories by Size</div>
+            <button class="btn btn-sm" onclick="loadDiskDirectories()">Refresh</button>
+          </div>
+          <table class="process-table">
+            <thead>
+              <tr>
+                <th>#</th>
+                <th>Directory</th>
+                <th>Size</th>
+                <th>Usage</th>
+              </tr>
+            </thead>
+            <tbody id="diskViewDirBody">
+              <tr>
+                <td colspan="4" style="text-align: center; color: var(--text-muted);">Loading...</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div><!-- End view-disk -->
+
+    <!-- VIEW: Network Monitoring -->
+    <div id="view-network" class="view-section" style="display: none;">
+      <div class="dashboard">
+        <!-- Network Stats Row -->
+        <div class="stats-row" style="grid-template-columns: repeat(4, 1fr);">
+          <div class="stat-card">
+            <div class="stat-label">Total Packets</div>
+            <div class="stat-value" id="networkTotalPackets">--</div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-label">Packets/Sec</div>
+            <div class="stat-value" id="networkPacketsPerSec">--</div>
+          </div>
+          <div class="stat-card" style="border-color: var(--warning);">
+            <div class="stat-label">🚨 Suspicious</div>
+            <div class="stat-value" id="networkSuspiciousCount" style="color: var(--warning);">--</div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-label">External Connections</div>
+            <div class="stat-value" id="networkExternalConnections">--</div>
+          </div>
+        </div>
+
+        <!-- Protocol Breakdown -->
+        <div class="chart-card" style="margin-bottom: 24px;">
+          <div class="chart-header">
+            <div class="chart-title">📊 Protocol Distribution</div>
+          </div>
+          <div id="protocol-breakdown" style="display: flex; gap: 16px; padding: 16px; flex-wrap: wrap;">
+            <div style="color: var(--text-muted);">Loading...</div>
+          </div>
+        </div>
+
+        <!-- Network Charts -->
+        <div class="charts-grid">
+          <div class="chart-card">
+            <div class="chart-header">
+              <div class="chart-title">🌐 Network Traffic</div>
+            </div>
+            <div class="chart-container">
+              <canvas id="networkViewChart" class="chart-canvas"></canvas>
+            </div>
+          </div>
+          <div class="chart-card">
+            <div class="chart-header">
+              <div class="chart-title">📈 Packets Over Time</div>
+            </div>
+            <div class="chart-container">
+              <canvas id="packetsChart" class="chart-canvas"></canvas>
+            </div>
+          </div>
+        </div>
+
+        <!-- Packet List Table -->
+        <div class="chart-card" style="margin-top: 24px;">
+          <div class="chart-header">
+            <div class="chart-title">📦 Recent Network Packets</div>
+            <button class="btn btn-sm" onclick="loadNetworkPackets()">Refresh</button>
+          </div>
+          <div style="max-height: 400px; overflow-y: auto;">
+            <table class="process-table">
+              <thead>
+                <tr>
+                  <th>Time</th>
+                  <th>Source IP</th>
+                  <th>Dest IP</th>
+                  <th>Port</th>
+                  <th>Protocol</th>
+                  <th>Payload</th>
+                  <th>Status</th>
+                </tr>
+              </thead>
+              <tbody id="networkPacketBody">
+                <tr>
+                  <td colspan="7" style="text-align: center; color: var(--text-muted);">Loading packets...</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        <!-- Sniffer Status -->
+        <div style="margin-top: 16px; padding: 12px; background: var(--bg-card); border: 1px solid var(--border); border-radius: 8px; font-size: 12px; color: var(--text-muted);">
+          <span id="snifferStatus">⏳ Checking sniffer status...</span>
+        </div>
+      </div>
+    </div><!-- End view-network -->
+
+    <!-- VIEW: Alerts & Remediation -->
+    <div id="view-alerts" class="view-section" style="display: none;">
+      <div class="dashboard">
+        <!-- Alerts Header -->
+        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 24px;">
+          <h2 style="margin: 0; color: var(--text-primary);">🚨 Active Alerts</h2>
+          <button class="btn btn-sm" onclick="loadAlerts()">⟳ Refresh</button>
+        </div>
+
+        <!-- Alerts Container -->
+        <div id="alertsContainer" style="display: grid; gap: 16px;">
+          <div style="text-align: center; padding: 40px; color: var(--text-muted);">
+            Loading alerts...
+          </div>
+        </div>
+
+        <!-- Alert History -->
+        <div class="chart-card" style="margin-top: 32px;">
+          <div class="chart-header">
+            <div class="chart-title">📜 Alert History</div>
+          </div>
+          <table class="process-table">
+            <thead>
+              <tr>
+                <th>Date</th>
+                <th>Alert Topic</th>
+                <th>Remediation Step</th>
+                <th>Status</th>
+              </tr>
+            </thead>
+            <tbody id="alertHistoryBody">
+              <tr>
+                <td colspan="4" style="text-align: center; color: var(--text-muted);">Loading history...</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div><!-- End view-alerts -->
+
   </main>
 
   <!-- Floating Chat Panel -->
@@ -1898,6 +2317,10 @@ const dashboardHTML = `<!DOCTYPE html>
       
       // Load view-specific data
       if (viewId === 'cpu') loadCPUView();
+      if (viewId === 'memory') loadMemoryView();
+      if (viewId === 'disk') loadDiskView();
+      if (viewId === 'network') loadNetworkView();
+      if (viewId === 'alerts') loadAlerts();
     }
 
     // ==========================================
@@ -2025,6 +2448,588 @@ const dashboardHTML = `<!DOCTYPE html>
     setInterval(() => {
       if (currentView === 'cpu') loadCPUView();
     }, 2000);
+
+    // ==========================================
+    // MEMORY VIEW DATA LOADING
+    // ==========================================
+    let memViewData = { used: [], swap: [] };
+    
+    async function loadMemoryView() {
+      // Load memory stats and chart
+      try {
+        const memRes = await fetch('/api/chart/system.ram?after=-60&points=60');
+        const memData = await memRes.json();
+        if (memData.data && memData.labels) {
+          // Calculate used memory percentage over time
+          const labels = memData.labels.slice(1);
+          const usedData = [];
+          let totalMem = 0;
+          let usedMem = 0;
+          let freeMem = 0;
+          let cachedMem = 0;
+          let buffersMem = 0;
+          
+          memData.data.forEach(row => {
+            const values = row.slice(1);
+            const total = values.reduce((a, b) => a + Math.abs(b || 0), 0);
+            // Find used memory (index varies, typically position 1 or look for 'used' label)
+            const usedIdx = labels.findIndex(l => l.toLowerCase() === 'used');
+            const freeIdx = labels.findIndex(l => l.toLowerCase() === 'free');
+            const cachedIdx = labels.findIndex(l => l.toLowerCase() === 'cached');
+            const buffersIdx = labels.findIndex(l => l.toLowerCase() === 'buffers');
+            
+            const used = Math.abs(values[usedIdx] || 0);
+            const pct = total > 0 ? (used / total * 100) : 0;
+            usedData.push(pct);
+            
+            // Store latest values for stats
+            totalMem = total;
+            usedMem = used;
+            freeMem = Math.abs(values[freeIdx] || 0);
+            cachedMem = Math.abs(values[cachedIdx] || 0);
+            buffersMem = Math.abs(values[buffersIdx] || 0);
+          });
+          
+          memViewData.used = usedData.reverse();
+          
+          // Update stats
+          const latestPct = memViewData.used[memViewData.used.length - 1] || 0;
+          document.getElementById('memViewUsed').textContent = latestPct.toFixed(1);
+          document.getElementById('memViewTotal').textContent = formatBytes(totalMem * 1024 * 1024);
+          
+          // Draw memory chart
+          drawChart('memViewChart', [
+            { label: 'Used %', data: memViewData.used, color: '#43a9ff' }
+          ], { unit: '%', maxY: 100 });
+          
+          // Update breakdown
+          updateMemoryBreakdown(labels, memData.data[0] ? memData.data[0].slice(1) : []);
+        }
+      } catch (e) { console.error('Memory view fetch error:', e); }
+      
+      // Load swap stats
+      try {
+        const swapRes = await fetch('/api/chart/mem.swap?after=-60&points=60');
+        const swapData = await swapRes.json();
+        if (swapData.data && swapData.labels) {
+          const labels = swapData.labels.slice(1);
+          const usedData = [];
+          let totalSwap = 0;
+          let usedSwap = 0;
+          
+          swapData.data.forEach(row => {
+            const values = row.slice(1);
+            const total = values.reduce((a, b) => a + Math.abs(b || 0), 0);
+            const usedIdx = labels.findIndex(l => l.toLowerCase() === 'used');
+            // Use proper null check - 0 is a valid value, not falsy here
+            const used = usedIdx >= 0 && values[usedIdx] !== undefined ? Math.abs(values[usedIdx]) : 0;
+            const pct = total > 0 ? (used / total * 100) : 0;
+            usedData.push(pct);
+            totalSwap = total;
+            usedSwap = used;
+          });
+          
+          memViewData.swap = usedData.reverse();
+          
+          // Update stats
+          const latestSwapPct = memViewData.swap[memViewData.swap.length - 1] || 0;
+          document.getElementById('memViewSwapUsed').textContent = latestSwapPct.toFixed(1);
+          document.getElementById('memViewSwapTotal').textContent = formatBytes(totalSwap * 1024 * 1024);
+          
+          // Draw swap chart
+          drawChart('swapViewChart', [
+            { label: 'Swap %', data: memViewData.swap, color: '#f5a623' }
+          ], { unit: '%', maxY: 100 });
+        }
+      } catch (e) { console.error('Swap view fetch error:', e); }
+      
+      // Load top processes by memory
+      await loadMemoryProcesses();
+    }
+    
+    function formatBytes(bytes) {
+      if (bytes >= 1073741824) return (bytes / 1073741824).toFixed(1) + ' GB';
+      if (bytes >= 1048576) return (bytes / 1048576).toFixed(1) + ' MB';
+      return (bytes / 1024).toFixed(1) + ' KB';
+    }
+    
+    function updateMemoryBreakdown(labels, values) {
+      const container = document.getElementById('memory-breakdown-container');
+      if (!container) return;
+      
+      const colors = {
+        'used': '#ef4444',
+        'free': '#10a37f',
+        'cached': '#43a9ff',
+        'buffers': '#a855f7',
+        'available': '#22c55e'
+      };
+      
+      container.innerHTML = '';
+      
+      for (var i = 0; i < labels.length; i++) {
+        var label = labels[i];
+        var value = Math.abs(values[i] || 0);
+        
+        if (value < 1) continue; // Skip very small values
+        
+        var color = colors[label.toLowerCase()] || '#666';
+        var card = document.createElement('div');
+        card.style.cssText = 'background: var(--bg-secondary); border: 1px solid var(--border); border-radius: 8px; padding: 12px; text-align: center;';
+        card.innerHTML = '<div style="font-size: 12px; color: var(--text-muted); margin-bottom: 4px; text-transform: capitalize;">' + label + '</div><div style="font-size: 18px; font-weight: 600; color: ' + color + ';">' + formatBytes(value * 1024 * 1024) + '</div>';
+        container.appendChild(card);
+      }
+      
+      if (container.children.length === 0) {
+        container.innerHTML = '<div style="color: var(--text-muted); text-align: center; grid-column: 1/-1;">No memory data</div>';
+      }
+    }
+    
+    async function loadMemoryProcesses() {
+      const tbody = document.getElementById('memViewProcessBody');
+      if (!tbody) return;
+      
+      try {
+        const res = await fetch('/api/processes?sort=memory');
+        const data = await res.json();
+        
+        if (data.processes && data.processes.length > 0) {
+          // Sort by memory and take top 10
+          const sorted = data.processes.sort((a, b) => (b.memory || 0) - (a.memory || 0)).slice(0, 10);
+          tbody.innerHTML = sorted.map(function(p) {
+            var memPct = p.memory || 0;
+            var barWidth = Math.min(memPct, 100);
+            var barColor = memPct > 50 ? 'var(--warning)' : '#43a9ff';
+            var cmdDisplay = p.command.length > 30 ? p.command.substring(0, 30) + '...' : p.command;
+            return '<tr><td style="font-family: JetBrains Mono, monospace; color: var(--accent);">' + p.pid + '</td><td class="process-name">' + cmdDisplay + '</td><td>' + memPct.toFixed(1) + '%</td><td><div class="process-bar"><div class="process-bar-fill" style="width: ' + barWidth + '%; background: ' + barColor + '"></div></div></td></tr>';
+          }).join('');
+        } else {
+          tbody.innerHTML = '<tr><td colspan="4" style="text-align: center; color: var(--text-muted);">No process data</td></tr>';
+        }
+      } catch (e) {
+        tbody.innerHTML = '<tr><td colspan="4" style="text-align: center; color: var(--error);">Error loading processes</td></tr>';
+      }
+    }
+    
+    // Auto-refresh Memory view if active
+    setInterval(() => {
+      if (currentView === 'memory') loadMemoryView();
+    }, 2000);
+
+    // ==========================================
+    // DISK VIEW DATA LOADING
+    // ==========================================
+    let diskViewData = { reads: [], writes: [], space: [] };
+    
+    async function loadDiskView() {
+      // Load disk space stats
+      try {
+        const spaceRes = await fetch('/api/chart/disk_space.%2F?after=-60&points=60');
+        const spaceData = await spaceRes.json();
+        if (spaceData.data && spaceData.labels) {
+          const labels = spaceData.labels.slice(1); // ['avail', 'used', 'reserved for root']
+          const latest = spaceData.data[0]?.slice(1) || [];
+          
+          const availIdx = labels.findIndex(l => l.toLowerCase().includes('avail'));
+          const usedIdx = labels.findIndex(l => l.toLowerCase() === 'used');
+          const reservedIdx = labels.findIndex(l => l.toLowerCase().includes('reserved'));
+          
+          const avail = availIdx >= 0 ? Math.abs(latest[availIdx]) : 0;
+          const used = usedIdx >= 0 ? Math.abs(latest[usedIdx]) : 0;
+          const reserved = reservedIdx >= 0 ? Math.abs(latest[reservedIdx]) : 0;
+          const total = avail + used + reserved;
+          const pct = total > 0 ? (used / total * 100) : 0;
+          
+          // Update stats
+          document.getElementById('diskViewTotal').textContent = formatBytes(total * 1024 * 1024 * 1024);
+          document.getElementById('diskViewUsed').textContent = formatBytes(used * 1024 * 1024 * 1024);
+          document.getElementById('diskViewAvail').textContent = formatBytes(avail * 1024 * 1024 * 1024);
+          document.getElementById('diskViewPercent').textContent = pct.toFixed(1);
+          
+          // Update breakdown
+          updateDiskBreakdown(labels, latest);
+          
+          // Draw space usage chart over time
+          const usedHistory = spaceData.data.map(row => {
+            const vals = row.slice(1);
+            const u = usedIdx >= 0 ? Math.abs(vals[usedIdx]) : 0;
+            return u;
+          }).reverse();
+          
+          diskViewData.space = usedHistory;
+          drawChart('diskSpaceChart', [
+            { label: 'Used (GB)', data: usedHistory, color: '#ef4444' }
+          ], { unit: ' GB' });
+        }
+      } catch (e) { console.error('Disk space fetch error:', e); }
+      
+      // Load disk I/O stats
+      try {
+        const ioRes = await fetch('/api/chart/system.io?after=-60&points=60');
+        const ioData = await ioRes.json();
+        if (ioData.data && ioData.labels) {
+          const labels = ioData.labels.slice(1);
+          const readsIdx = labels.findIndex(l => l.toLowerCase().includes('read'));
+          const writesIdx = labels.findIndex(l => l.toLowerCase().includes('write'));
+          
+          const reads = ioData.data.map(row => {
+            const val = row.slice(1)[readsIdx] || 0;
+            return Math.abs(val);
+          }).reverse();
+          
+          const writes = ioData.data.map(row => {
+            const val = row.slice(1)[writesIdx] || 0;
+            return Math.abs(val);
+          }).reverse();
+          
+          diskViewData.reads = reads;
+          diskViewData.writes = writes;
+          
+          drawChart('diskIOChart', [
+            { label: 'Reads', data: reads, color: '#10a37f' },
+            { label: 'Writes', data: writes, color: '#f5a623' }
+          ], { unit: ' KB/s' });
+        }
+      } catch (e) { console.error('Disk IO fetch error:', e); }
+      
+      // Load top directories
+      await loadDiskDirectories();
+    }
+    
+    function updateDiskBreakdown(labels, values) {
+      const container = document.getElementById('disk-breakdown-container');
+      if (!container) return;
+      
+      const colors = {
+        'avail': '#10a37f',
+        'used': '#ef4444',
+        'reserved for root': '#f5a623',
+        'reserved': '#f5a623'
+      };
+      
+      container.innerHTML = '';
+      
+      for (var i = 0; i < labels.length; i++) {
+        var label = labels[i];
+        var value = Math.abs(values[i] || 0);
+        
+        if (value < 0.01) continue;
+        
+        var colorKey = label.toLowerCase();
+        var color = colors[colorKey] || '#666';
+        for (var key in colors) {
+          if (colorKey.includes(key)) { color = colors[key]; break; }
+        }
+        
+        var card = document.createElement('div');
+        card.style.cssText = 'background: var(--bg-secondary); border: 1px solid var(--border); border-radius: 8px; padding: 12px; text-align: center;';
+        card.innerHTML = '<div style="font-size: 12px; color: var(--text-muted); margin-bottom: 4px; text-transform: capitalize;">' + label + '</div><div style="font-size: 18px; font-weight: 600; color: ' + color + ';">' + formatBytes(value * 1024 * 1024 * 1024) + '</div>';
+        container.appendChild(card);
+      }
+      
+      if (container.children.length === 0) {
+        container.innerHTML = '<div style="color: var(--text-muted); text-align: center; grid-column: 1/-1;">No disk data</div>';
+      }
+    }
+    
+    async function loadDiskDirectories() {
+      const tbody = document.getElementById('diskViewDirBody');
+      if (!tbody) return;
+      
+      try {
+        const res = await fetch('/api/disk-usage');
+        const data = await res.json();
+        
+        if (data.directories && data.directories.length > 0) {
+          tbody.innerHTML = data.directories.map(function(d, idx) {
+            var barWidth = parseFloat(d.percent) || 0;
+            var barColor = barWidth > 80 ? 'var(--error)' : barWidth > 50 ? 'var(--warning)' : 'var(--accent)';
+            var pathDisplay = d.path.length > 40 ? '...' + d.path.substring(d.path.length - 37) : d.path;
+            return '<tr><td style="font-family: JetBrains Mono, monospace; color: var(--text-muted);">' + (idx + 1) + '</td><td class="process-name" title="' + d.path + '">' + pathDisplay + '</td><td style="font-family: JetBrains Mono, monospace;">' + d.size + '</td><td><div class="process-bar"><div class="process-bar-fill" style="width: ' + barWidth + '%; background: ' + barColor + '"></div></div></td></tr>';
+          }).join('');
+        } else {
+          tbody.innerHTML = '<tr><td colspan="4" style="text-align: center; color: var(--text-muted);">No directory data</td></tr>';
+        }
+      } catch (e) {
+        tbody.innerHTML = '<tr><td colspan="4" style="text-align: center; color: var(--error);">Error loading directories</td></tr>';
+      }
+    }
+    
+    // Auto-refresh Disk view if active
+    setInterval(() => {
+      if (currentView === 'disk') loadDiskView();
+    }, 5000); // Disk is slower to update
+
+    // ==========================================
+    // NETWORK VIEW DATA LOADING
+    // ==========================================
+    let networkPacketsHistory = [];
+    
+    async function loadNetworkView() {
+      // Load network stats
+      await loadNetworkStats();
+      // Load packets
+      await loadNetworkPackets();
+      // Draw network traffic chart (reuse existing data)
+      drawChart('networkViewChart', [
+        { label: 'In', data: chartData.net.in, color: '#10a37f' },
+        { label: 'Out', data: chartData.net.out, color: '#f5a623' }
+      ], { unit: ' KB/s' });
+    }
+    
+    async function loadNetworkStats() {
+      try {
+        const res = await fetch('/api/network/stats');
+        const stats = await res.json();
+        
+        document.getElementById('networkTotalPackets').textContent = stats.total_packets || 0;
+        document.getElementById('networkPacketsPerSec').textContent = (stats.packets_per_second || 0).toFixed(1);
+        document.getElementById('networkSuspiciousCount').textContent = stats.suspicious_count || 0;
+        document.getElementById('networkExternalConnections').textContent = stats.external_connections || 0;
+        
+        // Update protocol breakdown
+        const protocolContainer = document.getElementById('protocol-breakdown');
+        if (protocolContainer) {
+          const protocols = stats.protocols || {};
+          if (Object.keys(protocols).length > 0) {
+            const colors = { TCP: '#10a37f', UDP: '#43a9ff', ICMP: '#f5a623', OTHER: '#a855f7' };
+            protocolContainer.innerHTML = Object.entries(protocols).map(function([proto, count]) {
+              const color = colors[proto] || '#666';
+              return '<div style="background: var(--bg-secondary); border: 1px solid var(--border); border-radius: 8px; padding: 12px 20px; text-align: center;"><div style="font-size: 12px; color: var(--text-muted); margin-bottom: 4px;">' + proto + '</div><div style="font-size: 20px; font-weight: 600; color: ' + color + ';">' + count + '</div></div>';
+            }).join('');
+          } else {
+            protocolContainer.innerHTML = '<div style="color: var(--text-muted);">No packets captured</div>';
+          }
+        }
+        
+        // Update sniffer status
+        const statusEl = document.getElementById('snifferStatus');
+        if (statusEl) {
+          if (!stats.scapy_available) {
+            statusEl.innerHTML = '⚠️ Scapy not installed - packet sniffing disabled';
+            statusEl.style.color = 'var(--warning)';
+          } else if (stats.is_running) {
+            statusEl.innerHTML = '✅ Packet capture active - Duration: ' + (stats.capture_duration_seconds || 0).toFixed(0) + 's';
+            statusEl.style.color = 'var(--accent)';
+          } else {
+            statusEl.innerHTML = '⚠️ Packet capture not running (requires sudo)';
+            statusEl.style.color = 'var(--warning)';
+          }
+        }
+        
+        // Update packets chart with history
+        networkPacketsHistory.push(stats.total_packets || 0);
+        if (networkPacketsHistory.length > 60) networkPacketsHistory.shift();
+        
+        drawChart('packetsChart', [
+          { label: 'Packets', data: networkPacketsHistory, color: '#a855f7' }
+        ]);
+        
+      } catch (e) {
+        console.error('Network stats error:', e);
+      }
+    }
+    
+    async function loadNetworkPackets() {
+      const tbody = document.getElementById('networkPacketBody');
+      if (!tbody) return;
+      
+      try {
+        const res = await fetch('/api/network/packets?limit=50');
+        const data = await res.json();
+        
+        if (data.packets && data.packets.length > 0) {
+          tbody.innerHTML = data.packets.map(function(p) {
+            const time = p.timestamp ? new Date(p.timestamp).toLocaleTimeString() : '--';
+            const isSuspicious = p.is_suspicious;
+            const isExternal = p.src_external || p.dst_external;
+            
+            // Determine row styling
+            let rowStyle = '';
+            let statusBadge = '<span style="color: var(--accent);">OK</span>';
+            
+            if (isSuspicious) {
+              rowStyle = 'background: rgba(239, 68, 68, 0.1); border-left: 3px solid var(--error);';
+              const reasons = (p.suspicious_reasons || []).slice(0, 2).join(', ');
+              statusBadge = '<span style="color: var(--error); font-weight: 600;" title="' + reasons + '">🚨 SUSPICIOUS</span>';
+            } else if (isExternal) {
+              rowStyle = 'background: rgba(245, 166, 35, 0.1);';
+              statusBadge = '<span style="color: var(--warning);">🌐 External</span>';
+            }
+            
+            // Style IPs
+            const srcStyle = p.src_external ? 'color: var(--warning); font-weight: 500;' : '';
+            const dstStyle = p.dst_external ? 'color: var(--warning); font-weight: 500;' : '';
+            
+            // Truncate payload
+            const payload = (p.payload_preview || '').substring(0, 30) || '-';
+            
+            return '<tr style="' + rowStyle + '">' +
+              '<td style="font-family: JetBrains Mono, monospace; font-size: 12px;">' + time + '</td>' +
+              '<td style="font-family: JetBrains Mono, monospace; ' + srcStyle + '">' + (p.src_ip || '-') + '</td>' +
+              '<td style="font-family: JetBrains Mono, monospace; ' + dstStyle + '">' + (p.dst_ip || '-') + '</td>' +
+              '<td>' + (p.port || '-') + '</td>' +
+              '<td><span style="background: var(--bg-secondary); padding: 2px 8px; border-radius: 4px; font-size: 12px;">' + (p.protocol || '-') + '</span></td>' +
+              '<td style="font-family: JetBrains Mono, monospace; font-size: 11px; max-width: 150px; overflow: hidden; text-overflow: ellipsis;">' + payload + '</td>' +
+              '<td>' + statusBadge + '</td>' +
+            '</tr>';
+          }).join('');
+        } else {
+          tbody.innerHTML = '<tr><td colspan="7" style="text-align: center; color: var(--text-muted);">No packets captured. Run backend with sudo for packet sniffing.</td></tr>';
+        }
+      } catch (e) {
+        console.error('Network packets error:', e);
+        tbody.innerHTML = '<tr><td colspan="7" style="text-align: center; color: var(--error);">Error loading packets</td></tr>';
+      }
+    }
+    
+    // Auto-refresh Network view if active
+    setInterval(() => {
+      if (currentView === 'network') loadNetworkView();
+    }, 2000);
+    
+    // ==========================================
+    // ALERTS VIEW DATA LOADING
+    // ==========================================
+    async function loadAlerts() {
+      const activeContainer = document.getElementById('alertsContainer');
+      const historyBody = document.getElementById('alertHistoryBody');
+      if (!activeContainer || !historyBody) return;
+      
+      try {
+        const res = await fetch('/api/alerts');
+        const data = await res.json();
+        
+        // Render Active Alerts
+        if (data.active && data.active.length > 0) {
+          activeContainer.innerHTML = data.active.map(function(alert) {
+            const severityColor = alert.severity === 'CRITICAL' ? 'var(--error)' : alert.severity === 'WARNING' ? 'var(--warning)' : 'var(--accent)';
+            const timestamp = new Date(alert.triggered_at).toLocaleString();
+            const alertId = alert.id || Math.random().toString(36).substr(2, 9);
+            
+            return '<div class="alert-card" id="alert-' + alertId + '" style="background: var(--bg-secondary); border: 1px solid var(--border); border-left: 4px solid ' + severityColor + '; border-radius: 8px; padding: 16px;">' +
+              '<div style="display: flex; justify-content: space-between; align-items: start; margin-bottom: 12px;">' +
+                '<div>' +
+                  '<div style="display: flex; align-items: center; gap: 8px; margin-bottom: 4px;">' +
+                    '<span style="font-weight: 600; color: var(--text-primary); font-size: 16px;">' + alert.metric_name + '</span>' +
+                    '<span style="background: ' + severityColor + '20; color: ' + severityColor + '; padding: 2px 8px; border-radius: 4px; font-size: 11px; font-weight: 600;">' + alert.severity + '</span>' +
+                  '</div>' +
+                  '<div style="font-size: 12px; color: var(--text-muted);">Triggered: ' + timestamp + '</div>' +
+                '</div>' +
+                '<div style="text-align: right; font-family: monospace;">' +
+                  '<div style="font-size: 18px; color: ' + severityColor + ';">' + parseFloat(alert.current_value).toFixed(2) + '</div>' +
+                  '<div style="font-size: 11px; color: var(--text-muted);">Threshold: ' + alert.threshold + '</div>' +
+                '</div>' +
+              '</div>' +
+              '<div id="diagnosis-' + alertId + '" style="display: none; margin-top: 16px; padding: 12px; background: rgba(0,0,0,0.2); border-radius: 6px;">' +
+                '<div style="font-size: 13px; font-weight: 600; margin-bottom: 8px; color: var(--accent);">🤖 AI Diagnosis</div>' +
+                '<div class="diagnosis-content" style="font-size: 13px; color: var(--text-secondary); margin-bottom: 12px;"></div>' +
+                '<div class="remediation-box" style="margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--border);">' +
+                  '<div style="font-size: 12px; font-weight: 600; margin-bottom: 4px;">Recommended Remediation:</div>' +
+                  '<div class="remediation-text" style="font-size: 13px; color: var(--text-primary); margin-bottom: 12px; font-style: italic;"></div>' +
+                  '<div style="display: flex; gap: 8px;">' +
+                    '<button class="btn btn-sm" style="background: var(--success); border-color: var(--success); color: white;" onclick="approveRemediation(\\'' + alertId + '\\')">Approve Fix</button>' +
+                    '<button class="btn btn-sm btn-outline" style="color: var(--error); border-color: var(--error);" onclick="rejectRemediation(\\'' + alertId + '\\')">Reject</button>' +
+                  '</div>' +
+                '</div>' +
+              '</div>' +
+              '<div style="margin-top: 12px; display: flex; gap: 8px;" id="actions-' + alertId + '">' +
+                '<button class="btn btn-sm btn-outline" onclick="diagnoseAlert(\\'' + alertId + '\\', \\'' + alert.metric_name + '\\', ' + alert.current_value + ', ' + alert.threshold + ', \\'' + alert.severity + '\\')">🔍 Diagnose with AI</button>' +
+                '<button class="btn btn-sm btn-outline" onclick="acknowledgeAlert(\\'' + alertId + '\\')">✓ Acknowledge</button>' +
+              '</div>' +
+            '</div>';
+          }).join('');
+        } else {
+          activeContainer.innerHTML = '<div style="text-align: center; padding: 40px; color: var(--text-muted); background: var(--bg-secondary); border-radius: 8px;">No active alerts</div>';
+        }
+        
+        // Render History
+        if (data.history && data.history.length > 0) {
+          historyBody.innerHTML = data.history.map(function(alert) {
+            const timestamp = new Date(alert.resolved_at || alert.triggered_at).toLocaleString();
+            const remediation = (alert.metadata && alert.metadata.remediation) || 'N/A';
+            const status = alert.status || (alert.resolved ? 'Closed' : 'Open');
+            const statusColors = { 'Closed': 'var(--success)', 'Open': 'var(--warning)', 'In-progress': 'var(--accent)' };
+            const statusColor = statusColors[status] || 'var(--text-muted)';
+            
+            return '<tr>' +
+              '<td style="color: var(--text-muted); font-size: 12px;">' + timestamp + '</td>' +
+              '<td style="font-weight: 500;">' + alert.metric_name + '</td>' +
+              '<td style="color: var(--text-secondary);">' + remediation + '</td>' +
+              '<td><span style="color: ' + statusColor + '; font-weight: 600;">' + status + '</span></td>' +
+            '</tr>';
+          }).join('');
+        } else {
+          historyBody.innerHTML = '<tr><td colspan="4" style="text-align: center; color: var(--text-muted);">No alert history found</td></tr>';
+        }
+      } catch (e) {
+        console.error('Failed to load alerts:', e);
+        activeContainer.innerHTML = '<div style="color: var(--error); text-align: center;">Failed to load alerts</div>';
+      }
+    }
+    
+    // Interactive Alert Functions
+    window.diagnoseAlert = async function(id, metric, value, threshold, severity) {
+      const diagDiv = document.getElementById('diagnosis-' + id);
+      const btnDiv = document.getElementById('actions-' + id);
+      if (!diagDiv) return;
+      
+      diagDiv.style.display = 'block';
+      diagDiv.querySelector('.diagnosis-content').innerHTML = '<span style="color: var(--accent);">Analyzing...</span>';
+      
+      try {
+        const res = await fetch('/api/alerts/' + id + '/diagnose', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ alert_id: id, metric_name: metric, current_value: value, threshold: threshold })
+        });
+        const data = await res.json();
+        
+        diagDiv.dataset.remediation = data.remediation || 'Check manual logs';
+        diagDiv.dataset.severity = severity;
+        diagDiv.dataset.metric = metric;
+        
+        diagDiv.querySelector('.diagnosis-content').textContent = data.analysis || 'No analysis provided';
+        diagDiv.querySelector('.remediation-text').textContent = data.remediation || 'Investigate manually';
+        
+        if (btnDiv) btnDiv.style.display = 'none';
+      } catch (e) {
+        diagDiv.querySelector('.diagnosis-content').textContent = 'Diagnosis failed. Please check backend logs.';
+      }
+    };
+    
+    window.approveRemediation = async function(id) {
+      const diagDiv = document.getElementById('diagnosis-' + id);
+      if (!diagDiv) return;
+      
+      try {
+        await fetch('/api/alerts/' + id + '/approve', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ alert_id: id, remediation: diagDiv.dataset.remediation })
+        });
+        alert('Remediation approved!');
+        setTimeout(loadAlerts, 1000);
+      } catch (e) {
+        console.error(e);
+        alert('Failed to approve remediation');
+      }
+    };
+    
+    window.rejectRemediation = async function(id) {
+      if (!confirm('Reject this remediation plan?')) return;
+      
+      try {
+        await fetch('/api/alerts/' + id + '/reject', { method: 'POST' });
+        document.getElementById('diagnosis-' + id).style.display = 'none';
+        document.getElementById('actions-' + id).style.display = 'flex';
+      } catch (e) { console.error(e); }
+    };
+    
+    window.acknowledgeAlert = async function(id) {
+      const card = document.getElementById('alert-' + id);
+      if (card) card.style.opacity = '0.6';
+    };
   </script>
 </body>
 </html>

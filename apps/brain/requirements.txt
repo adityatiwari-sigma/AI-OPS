@@ -11,3 +11,4 @@ openai
 langgraph
 asyncpg
 aiohttp>=3.9.0
+scapy>=2.5.0

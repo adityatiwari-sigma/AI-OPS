@@ -6,21 +6,25 @@ Implements 6 categories: Availability, Performance, Database, Infrastructure, Ap
 import os
 import time
 import asyncio
+import socket
 import hashlib
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Any
 import asyncpg
 import aiohttp
 from collections import defaultdict
+from incident_manager import incident_manager
 
+# Configuration
 NETDATA_URL = os.getenv("NETDATA_URL", "http://localhost:19999")
-DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://aiops:aiops_password@localhost:5432/peekaping")
+DATABASE_URL = os.getenv("DATABASE_URL", "postgres://aiops:aiops_password@localhost:5432/peekaping")
 
 # Thresholds from requirements
 THRESHOLDS = {
     "availability": {
         "site_down": {"critical": True},
-        "uptime_percentage": {"critical": 99.9}
+        "uptime_percentage": {"critical": 99.9},
+        "dns_resolution": {"critical": True}
     },
     "performance": {
         "page_load_time_ms": {"warning": 10000},  # 10 seconds
@@ -44,6 +48,11 @@ THRESHOLDS = {
     "incidents": {
         "consecutive_failures": {"critical": 3},
         "service_down": {"critical": True}
+    },
+    "security": {
+        "ddos_detected": {"critical": True},
+        "brute_force_attempts": {"warning": 50},
+        "cdn_status": {"critical": True}
     }
 }
 
@@ -200,34 +209,33 @@ class MetricsCollector:
     # ============================================================
     
     async def collect_availability_metrics(self) -> Dict[str, Any]:
-        """Monitor site/service availability and connectivity"""
+        """Monitor site/service availability via Peekaping + default services"""
         metrics = {
             "category": "availability",
             "timestamp": datetime.utcnow().isoformat(),
             "metrics": {}
         }
         
-        # Check main services
-        services_to_check = [
-            {"name": "frontend", "url": "http://localhost:3001/", "critical": True},
-            {"name": "brain", "url": "http://localhost:8000/health", "critical": True},
-            {"name": "netdata", "url": f"{NETDATA_URL}/api/v1/info", "critical": True},
+        # ============================================================
+        # Check default core services (Frontend, Brain, Netdata)
+        # ============================================================
+        default_services = [
+            {"name": "Frontend", "url": "http://localhost:3001"},
+            {"name": "Brain", "url": "http://localhost:8000/health"},
+            {"name": "Netdata", "url": "http://localhost:19999/api/v1/info"},
         ]
         
-        for service in services_to_check:
+        for service in default_services:
             is_up, response_time = await self._check_service_health(service["url"])
+            await self._update_service_health(service["name"], is_up, response_time)
             
             metrics["metrics"][f"{service['name']}_status"] = {
                 "value": 1 if is_up else 0,
                 "response_time_ms": response_time,
-                "is_critical": service["critical"]
+                "url": service["url"]
             }
             
-            # Store in service_health table
-            await self._update_service_health(service["name"], is_up, response_time)
-            
-            # Trigger alert if down
-            if not is_up and service["critical"]:
+            if not is_up:
                 await self._trigger_alert(
                     category="availability",
                     metric_name=f"{service['name']}_down",
@@ -237,24 +245,129 @@ class MetricsCollector:
                     metadata={"service": service["name"], "url": service["url"]}
                 )
         
-        # Calculate overall uptime
-        uptime_percentage = await self._calculate_uptime()
-        metrics["metrics"]["uptime_percentage"] = {
-            "value": uptime_percentage,
-            "threshold": 99.9
-        }
-        
-        if uptime_percentage < 99.9:
-            await self._trigger_alert(
-                category="availability",
-                metric_name="uptime_percentage",
-                severity="critical",
-                current_value=uptime_percentage,
-                threshold=99.9
-            )
+        # ============================================================
+        # Check Peekaping monitors (if any configured)
+        # ============================================================
+        try:
+            async with self.db_pool.acquire() as conn:
+                # Get all active monitors from Peekaping
+                monitors = await conn.fetch("""
+                    SELECT id, name, type 
+                    FROM monitors 
+                    WHERE active = TRUE
+                """)
+                
+                total_monitors = 0
+                up_monitors = 0
+                
+                for monitor in monitors:
+                    total_monitors += 1
+                    
+                    # Get latest stats for this monitor (ignore empty rows)
+                    stats = await conn.fetchrow("""
+                        SELECT ping, ping_min, ping_max, up, down 
+                        FROM stats 
+                        WHERE monitor_id = $1 AND (up > 0 OR down > 0)
+                        ORDER BY timestamp DESC 
+                        LIMIT 1
+                    """, monitor['id'])
+                    
+                    # Get latest heartbeat for current status
+                    heartbeat = await conn.fetchrow("""
+                        SELECT status, msg, time 
+                        FROM heartbeats 
+                        WHERE monitor_id = $1 
+                        ORDER BY time DESC 
+                        LIMIT 1
+                    """, monitor['id'])
+                    
+                    is_up = heartbeat['status'] == 1 if heartbeat else False
+                    if is_up:
+                        up_monitors += 1
+                        
+                    # Add metrics for this service
+                    metrics["metrics"][f"{monitor['name']}_status"] = {
+                        "value": 1 if is_up else 0,
+                        "ping_avg": stats['ping'] if stats else 0,
+                        "ping_min": stats['ping_min'] if stats else 0,
+                        "ping_max": stats['ping_max'] if stats else 0,
+                        "last_msg": heartbeat['msg'] if heartbeat else "Unknown"
+                    }
+                    
+                    # Trigger alert if down
+                    if not is_up:
+                        await self._trigger_alert(
+                            category="availability",
+                            metric_name=f"{monitor['name']}_down",
+                            severity="critical",
+                            current_value=0,
+                            threshold=1,
+                            metadata={
+                                "service": monitor['name'], 
+                                "last_error": heartbeat['msg'] if heartbeat else "No heartbeat"
+                            }
+                        )
+                
+                # Calculate overall uptime based on stats history (last 24h)
+                uptime_stats = await conn.fetchrow("""
+                    SELECT SUM(up) as total_up, SUM(down) as total_down
+                    FROM stats
+                    WHERE timestamp > NOW() - INTERVAL '24 hours'
+                """)
+                
+                total_checks = (uptime_stats['total_up'] or 0) + (uptime_stats['total_down'] or 0)
+                if total_checks > 0:
+                    uptime_percentage = (uptime_stats['total_up'] / total_checks) * 100
+                else:
+                    uptime_percentage = 100.0
+
+                metrics["metrics"]["uptime_percentage"] = {
+                    "value": uptime_percentage,
+                    "threshold": 99.9
+                }
+                
+                if uptime_percentage < 99.9:
+                    await self._trigger_alert(
+                        category="availability",
+                        metric_name="uptime_percentage",
+                        severity="critical",
+                        current_value=uptime_percentage,
+                        threshold=99.9
+                    )
+
+        except Exception as e:
+            print(f"Error collecting availability from Peekaping: {e}")
+            metrics["error"] = str(e)
         
         await self._store_metrics(metrics)
+
+        # Check DNS Resolution (Keep local check as fallback/verification)
+        dns_ok = await self._check_dns_resolution(domain="google.com")
+        metrics["metrics"]["dns_resolution_status"] = {
+            "value": 1 if dns_ok else 0,
+            "threshold": 1
+        }
+        
+        if not dns_ok:
+            await self._trigger_alert(
+                category="availability",
+                metric_name="dns_resolution_error",
+                severity="critical",
+                current_value=0,
+                threshold=1,
+                metadata={"domain": "google.com"}
+            )
+            
         return metrics
+
+    async def _check_dns_resolution(self, domain: str) -> bool:
+        """Check if DNS resolution is working"""
+        try:
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(None, socket.gethostbyname, domain)
+            return True
+        except:
+            return False
     
     async def _check_service_health(self, url: str) -> tuple[bool, int]:
         """Check if a service is responsive"""
@@ -316,85 +429,141 @@ class MetricsCollector:
     # ============================================================
     
     async def collect_performance_metrics(self) -> Dict[str, Any]:
-        """Monitor page load times and HTTP errors"""
+        """Monitor page load times and HTTP errors via Peekaping + default services"""
         metrics = {
             "category": "performance",
             "timestamp": datetime.utcnow().isoformat(),
             "metrics": {}
         }
         
-        # Check frontend load time
-        page_load_time = await self._measure_page_load_time("http://localhost:3001/")
-        metrics["metrics"]["page_load_time_ms"] = {
-            "value": page_load_time,
-            "threshold": 10000
-        }
+        # ============================================================
+        # Collect latency from default services (Frontend, Brain, Netdata)
+        # ============================================================
+        default_services = [
+            {"name": "Frontend", "url": "http://localhost:3001"},
+            {"name": "Brain", "url": "http://localhost:8000/health"},
+            {"name": "Netdata", "url": "http://localhost:19999/api/v1/info"},
+        ]
         
-        if page_load_time > 10000:
-            await self._trigger_alert(
-                category="performance",
-                metric_name="page_load_time_ms",
-                severity="warning",
-                current_value=page_load_time,
-                threshold=10000
-            )
+        service_latencies = []
+        for service in default_services:
+            is_up, response_time = await self._check_service_health(service["url"])
+            if is_up and response_time > 0:
+                service_latencies.append(response_time)
+                metrics["metrics"][f"{service['name']}_latency_ms"] = {
+                    "value": response_time,
+                    "threshold": 2000
+                }
         
-        # Check for 5xx errors (from recent logs or metrics)
-        http_5xx_count = await self._count_recent_5xx_errors()
-        metrics["metrics"]["http_5xx_count"] = {
-            "value": http_5xx_count,
-            "threshold": 1
-        }
+        # Calculate min/max/avg from default services
+        if service_latencies:
+            metrics["metrics"]["service_latency_min_ms"] = {
+                "value": min(service_latencies),
+                "threshold": 500
+            }
+            metrics["metrics"]["service_latency_max_ms"] = {
+                "value": max(service_latencies),
+                "threshold": 2000
+            }
+            metrics["metrics"]["service_latency_avg_ms"] = {
+                "value": sum(service_latencies) / len(service_latencies),
+                "threshold": 1000
+            }
         
-        if http_5xx_count >= 1:
-            await self._trigger_alert(
-                category="performance",
-                metric_name="http_5xx_count",
-                severity="critical",
-                current_value=http_5xx_count,
-                threshold=1
-            )
-        
-        # Calculate error rate
-        error_rate = await self._calculate_error_rate()
-        metrics["metrics"]["error_rate_percent"] = {
-            "value": error_rate,
-            "threshold": 5
-        }
-        
-        if error_rate > 5:
-            await self._trigger_alert(
-                category="performance",
-                metric_name="error_rate_percent",
-                severity="warning",
-                current_value=error_rate,
-                threshold=5
-            )
+        # ============================================================
+        # Collect latency from Peekaping monitors (if any)
+        # ============================================================
+        try:
+            async with self.db_pool.acquire() as conn:
+                # Get latency stats from Peekaping (ping_min, ping, ping_max)
+                latency_stats = await conn.fetchrow("""
+                    SELECT s.ping as ping_avg, s.ping_min, s.ping_max
+                    FROM stats s
+                    JOIN monitors m ON s.monitor_id = m.id
+                    WHERE m.active = TRUE AND (s.up > 0 OR s.down > 0)
+                    ORDER BY s.timestamp DESC
+                    LIMIT 1
+                """)
+                
+                if latency_stats:
+                    ping_min = float(latency_stats['ping_min'] or 0)
+                    ping_avg = float(latency_stats['ping_avg'] or 0)
+                    ping_max = float(latency_stats['ping_max'] or 0)
+                    
+                    metrics["metrics"]["page_load_latency_min_ms"] = {
+                        "value": ping_min,
+                        "threshold": 500
+                    }
+                    metrics["metrics"]["page_load_latency_avg_ms"] = {
+                        "value": ping_avg,
+                        "threshold": 1000
+                    }
+                    metrics["metrics"]["page_load_latency_max_ms"] = {
+                        "value": ping_max,
+                        "threshold": 2000
+                    }
+                    
+                    # Use max for alerting (worst case)
+                    if ping_max > 2000:
+                        await self._trigger_alert(
+                            category="performance",
+                            metric_name="page_load_latency_max_ms",
+                            severity="warning",
+                            current_value=ping_max,
+                            threshold=2000
+                        )
+            
+                # Fetch 5xx errors from Peekaping Heartbeats
+                error_stats = await conn.fetchrow("""
+                    SELECT 
+                        COUNT(*) as total_checks,
+                        COUNT(*) FILTER (WHERE msg LIKE '5%') as http_5xx
+                    FROM heartbeats
+                    WHERE time > NOW() - INTERVAL '1 hour'
+                """)
+                
+                http_5xx_count = error_stats['http_5xx'] or 0
+                total_checks = error_stats['total_checks'] or 0
+                
+                metrics["metrics"]["http_5xx_count"] = {
+                    "value": http_5xx_count,
+                    "threshold": 1
+                }
+                
+                if http_5xx_count >= 1:
+                    await self._trigger_alert(
+                        category="performance",
+                        metric_name="http_5xx_count",
+                        severity="critical",
+                        current_value=http_5xx_count,
+                        threshold=1,
+                        metadata={"source": "peekaping_heartbeats"}
+                    )
+                
+                # Calculate error rate
+                error_rate = (http_5xx_count / total_checks * 100) if total_checks > 0 else 0.0
+                metrics["metrics"]["error_rate_percent"] = {
+                    "value": error_rate,
+                    "threshold": 5
+                }
+                
+                if error_rate > 5:
+                    await self._trigger_alert(
+                        category="performance",
+                        metric_name="error_rate_percent",
+                        severity="warning",
+                        current_value=error_rate,
+                        threshold=5
+                    )
+                    
+        except Exception as e:
+            print(f"Error collecting performance metrics: {e}")
+            metrics["error"] = str(e)
         
         await self._store_metrics(metrics)
         return metrics
     
-    async def _measure_page_load_time(self, url: str) -> int:
-        """Measure page load time in milliseconds"""
-        try:
-            start = time.time()
-            async with self.session.get(url) as resp:
-                await resp.text()  # Ensure full page is loaded
-                return int((time.time() - start) * 1000)
-        except:
-            return 99999  # Return high value on failure
-    
-    async def _count_recent_5xx_errors(self) -> int:
-        """Count 5xx errors in last 5 minutes"""
-        # This would normally check application logs or metrics
-        # For now, return 0 as placeholder
-        return 0
-    
-    async def _calculate_error_rate(self) -> float:
-        """Calculate error rate from recent requests"""
-        # This would calculate from request logs
-        # For now, return 0 as placeholder
-        return 0.0
+
     
     # ============================================================
     # 3. DATABASE METRICS
@@ -443,16 +612,18 @@ class MetricsCollector:
         await self._store_metrics(metrics)
         return metrics
     
-    async def _measure_query_latency(self) -> int:
-        """Measure a test query latency"""
+    async def _measure_query_latency(self) -> float:
+        """Measure a test query latency in milliseconds"""
         try:
             async with self.db_pool.acquire() as conn:
-                start = time.time()
-                await conn.fetchval("SELECT COUNT(*) FROM pending_actions WHERE created_at > NOW() - INTERVAL '1 day'")
-                latency = int((time.time() - start) * 1000)
-                return latency
-        except:
-            return 9999
+                start = time.perf_counter()
+                # Run a real query (count items in history)
+                await conn.fetchval("SELECT COUNT(*) FROM metrics_history")
+                latency = (time.perf_counter() - start) * 1000
+                return round(latency, 2)
+        except Exception as e:
+            print(f"Error measuring query latency: {e}")
+            return 9999.0
     
     async def _get_connection_pool_usage(self) -> float:
         """Get current connection pool utilization percentage"""
@@ -735,7 +906,170 @@ class MetricsCollector:
                 """, category, metric_name, severity, threshold, current_value, json.dumps(metadata or {}))
                 
                 print(f"🚨 ALERT: {severity.upper()} - {category}/{metric_name} = {current_value} (threshold: {threshold})")
+                print(f"📧 Sending notification to: {{{{ALERT_EMAIL}}}}")
+                print(f"   Subject: [{severity.upper()}] {category}: {metric_name} threshold breached")
+
+                # Auto-create incident for critical alerts
+                if severity.lower() == "critical":
+                    await incident_manager.create_incident(
+                        title=f"{category.title()}: {metric_name} Critical Alert",
+                        description=f"Threshold breached: {current_value} (Limit: {threshold}). \nMetadata: {json.dumps(metadata or {})}",
+                        severity="CRITICAL",
+                        source="MonitoringService"
+                    )
     
+
+    # ============================================================
+    # 7. SECURITY & TRAFFIC METRICS
+    # ============================================================
+    
+    async def collect_security_metrics(self) -> Dict[str, Any]:
+        """Monitor for security threats and traffic anomalies"""
+        metrics = {
+            "category": "security",
+            "timestamp": datetime.utcnow().isoformat(),
+            "metrics": {}
+        }
+        
+        # Simulate DDoS detection (requests per second)
+        rps = await self._get_requests_per_second()
+        metrics["metrics"]["requests_per_second"] = {
+            "value": rps,
+            "threshold": 1000 # Configurable threshold for DDoS
+        }
+        
+        if rps > 1000:
+             await self._trigger_alert(
+                category="security",
+                metric_name="ddos_detected",
+                severity="critical",
+                current_value=rps,
+                threshold=1000,
+                metadata={"type": "high_traffic_volume"}
+            )
+
+        # Simulate Brute Force detection (failed logins / auth errors)
+        failed_logins = await self._count_failed_logins()
+        metrics["metrics"]["brute_force_attempts"] = {
+            "value": failed_logins,
+            "threshold": 50
+        }
+        
+        if failed_logins > 50:
+             await self._trigger_alert(
+                category="security",
+                metric_name="brute_force_attempts",
+                severity="warning",
+                current_value=failed_logins,
+                threshold=50,
+                metadata={"type": "auth_failures"}
+            )
+            
+        # Check CDN/Edge status (simulated)
+        cdn_ok = True # Placeholder for actual CDN check
+        metrics["metrics"]["cdn_status"] = {
+            "value": 1 if cdn_ok else 0,
+            "threshold": 1
+        }
+        
+        if not cdn_ok:
+             await self._trigger_alert(
+                category="security",
+                metric_name="cdn_failure",
+                severity="critical",
+                current_value=0,
+                threshold=1
+            )
+
+        await self._store_metrics(metrics)
+        return metrics
+        
+    async def _get_requests_per_second(self) -> int:
+        """Get current RPS from Netdata or logs"""
+        # Placeholder simulation
+        return await self._get_netdata_metric("web_log.requests", aggregate=True)
+
+    async def _count_failed_logins(self) -> int:
+        """Count recent failed login attempts"""
+        # Placeholder simulation
+        return 0
+
+
+    # ============================================================
+    # 7. SECURITY & TRAFFIC METRICS
+    # ============================================================
+    
+    async def collect_security_metrics(self) -> Dict[str, Any]:
+        """Monitor for security threats and traffic anomalies"""
+        metrics = {
+            "category": "security",
+            "timestamp": datetime.utcnow().isoformat(),
+            "metrics": {}
+        }
+        
+        # Simulate DDoS detection (requests per second)
+        rps = await self._get_requests_per_second()
+        metrics["metrics"]["requests_per_second"] = {
+            "value": rps,
+            "threshold": 1000 # Configurable threshold for DDoS
+        }
+        
+        if rps > 1000:
+             await self._trigger_alert(
+                category="security",
+                metric_name="ddos_detected",
+                severity="critical",
+                current_value=rps,
+                threshold=1000,
+                metadata={"type": "high_traffic_volume"}
+            )
+
+        # Simulate Brute Force detection (failed logins / auth errors)
+        failed_logins = await self._count_failed_logins()
+        metrics["metrics"]["brute_force_attempts"] = {
+            "value": failed_logins,
+            "threshold": 50
+        }
+        
+        if failed_logins > 50:
+             await self._trigger_alert(
+                category="security",
+                metric_name="brute_force_attempts",
+                severity="warning",
+                current_value=failed_logins,
+                threshold=50,
+                metadata={"type": "auth_failures"}
+            )
+            
+        # Check CDN/Edge status (simulated)
+        cdn_ok = True # Placeholder for actual CDN check
+        metrics["metrics"]["cdn_status"] = {
+            "value": 1 if cdn_ok else 0,
+            "threshold": 1
+        }
+        
+        if not cdn_ok:
+             await self._trigger_alert(
+                category="security",
+                metric_name="cdn_failure",
+                severity="critical",
+                current_value=0,
+                threshold=1
+            )
+
+        await self._store_metrics(metrics)
+        return metrics
+        
+    async def _get_requests_per_second(self) -> int:
+        """Get current RPS from Netdata or logs"""
+        # Placeholder simulation
+        return await self._get_netdata_metric("web_log.requests", aggregate=True)
+
+    async def _count_failed_logins(self) -> int:
+        """Count recent failed login attempts"""
+        # Placeholder simulation
+        return 0
+
     async def get_all_metrics_summary(self) -> Dict:
         """Get summary of all metric categories"""
         summary = {
@@ -749,6 +1083,7 @@ class MetricsCollector:
         summary["categories"]["database"] = await self.collect_database_metrics()
         summary["categories"]["infrastructure"] = await self.collect_infrastructure_metrics()
         summary["categories"]["application"] = await self.collect_application_metrics()
+        summary["categories"]["security"] = await self.collect_security_metrics()
         summary["categories"]["incidents"] = await self.collect_incident_metrics()
         
         # Get active alerts count

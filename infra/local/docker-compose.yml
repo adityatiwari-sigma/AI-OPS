@@ -26,7 +26,7 @@ services:
     restart: unless-stopped
 
   # ==========================================
-  # Postgres Database
+  # Postgres Database (Shared)
   # ==========================================
   aiops-db:
     image: postgres:15-alpine
@@ -36,7 +36,7 @@ services:
     environment:
       POSTGRES_USER: aiops
       POSTGRES_PASSWORD: aiops_password
-      POSTGRES_DB: aiops_brain
+      POSTGRES_DB: peekaping
     volumes:
       - pgdata:/var/lib/postgresql/data
     restart: unless-stopped
@@ -51,14 +51,16 @@ services:
       - "3002:8034"
       - "3003:8383"
     environment:
-      DB_USER: aiops
-      DB_PASS: aiops_password
       DB_HOST: aiops-db
       DB_PORT: 5432
+      DB_USER: aiops
+      DB_PASS: aiops_password
       DB_NAME: peekaping
+      TZ: Asia/Kolkata
     depends_on:
       - aiops-db
     restart: unless-stopped
+
 
   # ==========================================
   # Ansible-EDA

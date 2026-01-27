@@ -21,6 +21,8 @@ import asyncpg
 
 # Monitoring Service
 from monitoring_service import metrics_collector
+from incident_manager import incident_manager
+from network_sniffer import get_network_sniffer, start_network_capture, stop_network_capture
 
 app = FastAPI(title="AIOps Brain", version="3.0.0")
 
@@ -36,7 +38,7 @@ app.add_middleware(
 # Configuration
 NETDATA_URL = os.getenv("NETDATA_URL", "http://localhost:19999")
 CEREBRAS_API_KEY = 'csk-vtykhvxvxhtnrtdrd3p892v48nfpd2mt49tpx4mr68d69559'
-DATABASE_URL = os.getenv("DATABASE_URL", "postgres://aiops:aiops_password@aiops-db:5432/peekaping")
+DATABASE_URL = os.getenv("DATABASE_URL", "postgres://aiops:aiops_password@localhost:5432/peekaping")
 
 # Database pool
 db_pool = None
@@ -509,6 +511,7 @@ async def run_metrics_collection():
 @app.on_event("startup")
 async def startup():
     await init_db()
+    await incident_manager.initialize()
     await metrics_collector.initialize()
     # Start background metrics collection
     asyncio.create_task(run_metrics_collection())
@@ -747,6 +750,26 @@ async def approve_action(action_id: str, request: ApprovalRequest):
         }
 
 
+@app.get("/incidents")
+async def list_incidents():
+    """List all incidents"""
+    return {"incidents": await incident_manager.list_incidents()}
+
+@app.get("/incidents/{incident_id}/rca")
+async def get_incident_rca(incident_id: str):
+    """Get Root Cause Analysis for an incident"""
+    rca = await incident_manager.generate_rca(incident_id)
+    return {"rca": rca}
+    
+@app.post("/incidents/{incident_id}/status")
+async def update_incident_status(incident_id: str, status: str, note: str = ""):
+    """Update incident status"""
+    try:
+        await incident_manager.update_status(incident_id, status, note)
+        return {"status": "updated"}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
 # Configuration for automation
 ANSIBLE_EDA_URL = os.getenv("ANSIBLE_EDA_URL", "http://localhost:5000")
 
@@ -794,7 +817,9 @@ async def execute_local_playbook(action_id: str, action: dict) -> dict:
     }
     
     playbook = playbook_map.get(action_type, "health_check.yml")
-    playbook_path = f"/Users/carsch18/OFFICE_WORK/aiops-platform/apps/automation/playbooks/{playbook}"
+    # Use relative path or env var
+    workspace_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
+    playbook_path = f"{workspace_root}/apps/automation/playbooks/{playbook}"
     
     try:
         # Check if ansible-playbook is available
@@ -994,6 +1019,44 @@ async def log_application_error(
     return {"logged": True}
 
 
+# ============================================================================
+# NETWORK MONITORING ENDPOINTS
+# ============================================================================
+
+@app.on_event("startup")
+async def start_network_sniffer():
+    """Start network packet capture on startup"""
+    try:
+        start_network_capture()
+        print("✅ Network packet capture started")
+    except Exception as e:
+        print(f"⚠️ Network capture failed (requires sudo): {e}")
+
+
+@app.on_event("shutdown")
+async def stop_network_sniffer():
+    """Stop network packet capture on shutdown"""
+    stop_network_capture()
+
+
+@app.get("/api/network/packets")
+async def get_network_packets(limit: int = 50):
+    """Get recent captured network packets"""
+    sniffer = get_network_sniffer()
+    packets = sniffer.get_packets(limit)
+    return {
+        "packets": packets,
+        "count": len(packets)
+    }
+
+
+@app.get("/api/network/stats")
+async def get_network_stats():
+    """Get network capture statistics"""
+    sniffer = get_network_sniffer()
+    return sniffer.get_stats()
+
+
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     """WebSocket for real-time updates on pending actions"""
@@ -1012,6 +1075,160 @@ async def websocket_endpoint(websocket: WebSocket):
     except WebSocketDisconnect:
         if websocket in websocket_connections:
             websocket_connections.remove(websocket)
+
+
+# ============================================================================
+# ALERTS & INCIDENT MANAGEMENT ENDPOINTS
+# ============================================================================
+
+@app.get("/api/active-alerts")
+async def get_active_alerts():
+    """Get all active alerts and recent history"""
+    if not db_pool:
+        await init_db()
+        
+    try:
+        async with db_pool.acquire() as conn:
+            # Fetch active alerts
+            active_rows = await conn.fetch("""
+                SELECT * FROM active_alerts 
+                WHERE resolved = FALSE 
+                ORDER BY triggered_at DESC
+            """)
+            
+            # Fetch recent history (resolved alerts)
+            history_rows = await conn.fetch("""
+                SELECT * FROM active_alerts 
+                WHERE resolved = TRUE 
+                ORDER BY resolved_at DESC 
+                LIMIT 50
+            """)
+            
+            # Convert to dicts
+            active = [dict(r) for r in active_rows]
+            history = [dict(r) for r in history_rows]
+            
+            # Format dates isoformat
+            for r in active + history:
+                for k, v in r.items():
+                    if isinstance(v, datetime):
+                        r[k] = v.isoformat()
+            
+            return {
+                "active": active, 
+                "history": history
+            }
+    except Exception as e:
+        # Return mock data if DB fails (for development)
+        print(f"DB Error fetching alerts: {e}")
+        return {
+            "active": [],
+            "history": []
+        }
+
+class DiagnoseRequest(BaseModel):
+    alert_id: str
+    metric_name: str
+    current_value: float
+    threshold: float
+    metadata: Optional[Dict[str, Any]] = {}
+
+@app.post("/api/diagnose-alert")
+async def diagnose_alert(request: DiagnoseRequest):
+    """Diagnose an alert using AI"""
+    if not cerebras_client:
+        return {
+            "analysis": "AI diagnosis unavailable (API key missing)",
+            "root_cause": "Unknown",
+            "remediation": "Check logs manually"
+        }
+        
+    prompt = f"""
+    Analyze this system alert:
+    Metric: {request.metric_name}
+    Current Value: {request.current_value}
+    Threshold: {request.threshold}
+    Metadata: {json.dumps(request.metadata)}
+    
+    Provide a JSON response with:
+    1. analysis: Brief explanation of what's happening
+    2. root_cause: Probable cause
+    3. remediation: Concrete steps to fix it
+    """
+    
+    try:
+        completion = cerebras_client.chat.completions.create(
+            model="llama3.3-70b",
+            messages=[
+                {"role": "system", "content": "You are a Site Reliability Engineer AI."},
+                {"role": "user", "content": prompt}
+            ],
+            response_format={"type": "json_object"}
+        )
+        
+        result = json.loads(completion.choices[0].message.content)
+        return result
+    except Exception as e:
+        print(f"Diagnosis error: {e}")
+        return {
+            "analysis": "AI analysis failed",
+            "root_cause": "Error calling AI service",
+            "remediation": "Investigate manually"
+        }
+
+class IncidentCreateRequest(BaseModel):
+    title: str
+    description: str
+    severity: str
+    alert_id: Optional[str] = None
+    remediation_plan: Optional[str] = None
+
+@app.post("/api/create-incident")
+async def create_incident_endpoint(request: IncidentCreateRequest):
+    """Create a new incident from an alert"""
+    if not db_pool:
+        await init_db()
+        
+    try:
+        incident_id = await incident_manager.create_incident(
+            title=request.title,
+            description=request.description,
+            severity=request.severity,
+            source="User Approved Alert"
+        )
+        
+        # If there's a remediation plan, add it to the incident
+        if request.remediation_plan:
+             await incident_manager.add_timeline_event(
+                 incident_id, 
+                 "Remediation Approved", 
+                 request.remediation_plan
+             )
+             
+             # In a real system, we might execute an action here
+             # For now, just mark it as approved/in-progress
+             await incident_manager.update_status(incident_id, "MITIGATING", "Remediation plan approved by user")
+        
+        # Mark alert as resolved in active_alerts if alert_id is provided
+        if request.alert_id:
+             async with db_pool.acquire() as conn:
+                try:
+                    await conn.execute("""
+                        UPDATE active_alerts 
+                        SET resolved = TRUE, resolved_at = NOW() 
+                        WHERE id = $1
+                    """, request.alert_id) # ID should be UUID type? Let asyncpg handle it or cast
+                except:
+                    # Try with UUID cast if string fails
+                    await conn.execute("""
+                        UPDATE active_alerts 
+                        SET resolved = TRUE, resolved_at = NOW() 
+                        WHERE id = $1::uuid
+                    """, request.alert_id)
+
+        return {"incident_id": incident_id, "status": "created"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to create incident: {str(e)}")
 
 
 if __name__ == "__main__":
