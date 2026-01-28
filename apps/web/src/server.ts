@@ -1610,26 +1610,28 @@ const dashboardHTML = `<!DOCTYPE html>
         </div>
 
         <!-- Alert History -->
-        <div class="chart-card" style="margin-top: 32px;">
+        <div class="chart-card" style="margin-top: 32px; height: auto; min-height: min-content;">
           <div class="chart-header">
             <div class="chart-title">📜 Alert History</div>
           </div>
-          <table class="process-table">
-            <thead>
-              <tr>
-                <th>#</th>
-                <th>Name</th>
-                <th>Description</th>
-                <th>Remediation</th>
-                <th>Status</th>
-              </tr>
-            </thead>
-            <tbody id="alertHistoryBody">
-              <tr>
-                <td colspan="5" style="text-align: center; color: var(--text-muted);">Loading history...</td>
-              </tr>
-            </tbody>
-          </table>
+          <div style="overflow-x: auto; width: 100%;">
+            <table class="process-table">
+              <thead>
+                <tr>
+                  <th>#</th>
+                  <th>Name</th>
+                  <th>Description</th>
+                  <th>Remediation (Jist)</th>
+                  <th>Status</th>
+                </tr>
+              </thead>
+              <tbody id="alertHistoryBody">
+                <tr>
+                  <td colspan="5" style="text-align: center; color: var(--text-muted);">Loading history...</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
         </div>
       </div>
     </div><!-- End view-alerts -->
@@ -2976,11 +2978,14 @@ const dashboardHTML = `<!DOCTYPE html>
             const statusColors = { 'Approved': 'var(--accent)', 'Rejected': 'var(--error)', 'Closed': 'var(--success)', 'Open': 'var(--warning)', 'In-progress': 'var(--accent)' };
             const statusColor = statusColors[status] || 'var(--text-muted)';
             
+            // Truncate remediation for a "jist" view
+            const remediationJist = remediation.length > 80 ? remediation.substring(0, 77) + '...' : remediation;
+            
             return '<tr>' +
               '<td style="color: var(--text-muted); font-size: 12px;">' + (index + 1) + '</td>' +
               '<td style="font-weight: 500;">' + name + '</td>' +
-              '<td style="color: var(--text-secondary); max-width: 250px; overflow: hidden; text-overflow: ellipsis; white-space: pre-wrap;" title="' + description + '">' + description + '</td>' +
-              '<td style="color: var(--text-secondary); max-width: 250px; overflow: hidden; text-overflow: ellipsis; white-space: pre-wrap;" title="' + remediation + '">' + remediation + '</td>' +
+              '<td style="color: var(--text-secondary); max-width: 250px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;" title="' + description + '">' + description + '</td>' +
+              '<td style="color: var(--text-secondary); max-width: 300px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;" title="' + remediation + '">' + remediationJist + '</td>' +
               '<td><span style="color: ' + statusColor + '; font-weight: 600;">' + status + '</span></td>' +
             '</tr>';
           }).join('');

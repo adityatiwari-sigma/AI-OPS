@@ -501,11 +501,11 @@ async def run_metrics_collection():
             await asyncio.sleep(1)
             await metrics_collector.collect_incident_metrics()
             
-            # Wait before next round (collect every 30 seconds)
-            await asyncio.sleep(24)
+            # Wait before next round (collect every 10 seconds)
+            await asyncio.sleep(4)
         except Exception as e:
             print(f"Metrics collection error: {e}")
-            await asyncio.sleep(30)
+            await asyncio.sleep(10)
 
 
 # ============================================================================

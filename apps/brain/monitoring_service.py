@@ -65,6 +65,7 @@ class MetricsCollector:
         self.session = None
         self.error_cache = defaultdict(int)  # Track error signatures
         self.service_health = {}  # Track service health status
+        self.alert_rules = {}  # Cache for thresholds and rules
         
     async def initialize(self):
         """Initialize database connection and HTTP session"""
@@ -73,6 +74,7 @@ class MetricsCollector:
             self.session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10))
             await self._ensure_tables()
             await self._load_alert_rules()
+            await self._refresh_alert_rules()
             print("✅ Monitoring service initialized")
         except Exception as e:
             print(f"❌ Monitoring service initialization error: {e}")
@@ -217,6 +219,30 @@ class MetricsCollector:
                 """, rules)
                 
                 print(f"✅ Inserted {len(rules)} default alert rules")
+                
+    async def _refresh_alert_rules(self):
+        """Load rules from DB into memory for fast lookup"""
+        if not self.db_pool:
+            return
+            
+        try:
+            async with self.db_pool.acquire() as conn:
+                rows = await conn.fetch("SELECT category, metric_name, threshold, comparison, severity FROM alert_rules WHERE enabled = TRUE")
+                # Group by category then metric_name
+                new_rules = {}
+                for r in rows:
+                    cat = r['category']
+                    if cat not in new_rules:
+                        new_rules[cat] = {}
+                    new_rules[cat][r['metric_name']] = {
+                        'threshold': float(r['threshold']),
+                        'comparison': r['comparison'],
+                        'severity': r['severity']
+                    }
+                self.alert_rules = new_rules
+                print(f"🔄 Refreshed {len(rows)} alert rules from DB")
+        except Exception as e:
+            print(f"⚠️ Failed to refresh alert rules: {e}")
     
     # ============================================================
     # 1. AVAILABILITY METRICS
@@ -488,15 +514,15 @@ class MetricsCollector:
         
         # Calculate min/max/avg from default services
         if service_latencies:
-            metrics["metrics"]["service_latency_min_ms"] = {
+            metrics["metrics"]["page_load_latency_min_ms"] = {
                 "value": min(service_latencies),
                 "threshold": 500
             }
-            metrics["metrics"]["service_latency_max_ms"] = {
+            metrics["metrics"]["page_load_latency_max_ms"] = {
                 "value": max(service_latencies),
                 "threshold": page_load_thresh
             }
-            metrics["metrics"]["service_latency_avg_ms"] = {
+            metrics["metrics"]["page_load_latency_avg_ms"] = {
                 "value": sum(service_latencies) / len(service_latencies),
                 "threshold": 1000
             }
@@ -759,9 +785,10 @@ class MetricsCollector:
                 if data.get('data') and len(data['data']) > 0:
                     values = data['data'][0][1:]
                     total = sum(abs(v) for v in values if v is not None)
-                    # Assuming used memory is the second value
-                    used = abs(values[1]) if len(values) > 1 else 0
-                    return (used / total * 100) if total > 0 else 0
+                    free = abs(values[0]) if len(values) > 0 else 0
+                    # Standard "Used" = Total - Free (includes cache/buffers)
+                    used = total - free
+                    return round((used / total * 100), 2) if total > 0 else 0
         except:
             return 0
         return 0
@@ -914,16 +941,30 @@ class MetricsCollector:
     async def _store_metrics(self, metrics_data: Dict):
         """Store metrics in history table"""
         import json
+        if not self.db_pool: return
+        
         async with self.db_pool.acquire() as conn:
+            # Refresh rules at start of cycle to ensure latest thresholds
+            if metrics_data.get("category") == "availability":
+                await self._refresh_alert_rules()
+                
             for metric_name, metric_value in metrics_data["metrics"].items():
                 value = metric_value.get("value", 0)
                 threshold = metric_value.get("threshold")
+                severity = metric_value.get("severity") 
+                
+                # Try to look up severity if missing
+                if not severity:
+                    cat = metrics_data.get("category")
+                    rule = self.alert_rules.get(cat, {}).get(metric_name)
+                    if rule:
+                         severity = rule['severity']
                 
                 await conn.execute("""
                     INSERT INTO metrics_history 
-                    (category, metric_name, value, threshold, metadata)
-                    VALUES ($1, $2, $3, $4, $5)
-                """, metrics_data["category"], metric_name, value, threshold, json.dumps(metric_value))
+                    (category, metric_name, value, threshold, severity, metadata)
+                    VALUES ($1, $2, $3, $4, $5, $6)
+                """, metrics_data["category"], metric_name, value, threshold, severity, json.dumps(metric_value))
     
     async def _trigger_alert(self, category: str, metric_name: str, severity: str, 
                             current_value: float, threshold: float, metadata: dict = None):
