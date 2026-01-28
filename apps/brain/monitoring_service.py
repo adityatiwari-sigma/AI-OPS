@@ -23,22 +23,22 @@ DATABASE_URL = os.getenv("DATABASE_URL", "postgres://aiops:aiops_password@localh
 THRESHOLDS = {
     "availability": {
         "site_down": {"critical": True},
-        "uptime_percentage": {"critical": 99.9},
+        "uptime_percentage": {"critical": 95.0},
         "dns_resolution": {"critical": True}
     },
     "performance": {
-        "page_load_time_ms": {"warning": 10000},  # 10 seconds
+        "page_load_time_ms": {"warning": 2000},  # 2 seconds
         "http_5xx_count": {"critical": 1},
         "error_rate_percent": {"warning": 5, "critical": 10}
     },
     "database": {
-        "query_latency_ms": {"warning": 3000},
-        "slow_query_ms": {"warning": 1000},
+        "query_latency_ms": {"warning": 1000},
+        "slow_query_ms": {"warning": 500},
         "connection_pool_percent": {"warning": 80}
     },
     "infrastructure": {
-        "cpu_percent": {"warning": 80},
-        "memory_percent": {"warning": 80},
+        "cpu_percent": {"warning": 70},
+        "memory_percent": {"warning": 70},
         "disk_percent": {"warning": 80}
     },
     "application": {
@@ -120,6 +120,20 @@ class MetricsCollector:
                 )
             """)
             
+            # Resolved alerts table (stores approved/rejected alerts)
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS resolved_alerts (
+                    id SERIAL PRIMARY KEY,
+                    name VARCHAR(100) NOT NULL,
+                    description TEXT,
+                    remediation_proposed TEXT,
+                    status VARCHAR(20) NOT NULL,
+                    resolved_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    original_alert_id UUID,
+                    metadata JSONB
+                )
+            """)
+            
             # Alert rules table
             await conn.execute("""
                 CREATE TABLE IF NOT EXISTS alert_rules (
@@ -173,20 +187,20 @@ class MetricsCollector:
                 # Insert default rules based on THRESHOLDS
                 rules = [
                     # Availability
-                    ('availability', 'uptime_percentage', 99.9, '<', 'critical', True, 300, None),
+                    ('availability', 'uptime_percentage', 90, '>=', 'critical', True, 300, None),
                     
                     # Performance
-                    ('performance', 'page_load_time_ms', 10000, '>', 'warning', True, 300, None),
+                    ('performance', 'page_load_time_ms', 2000, '>', 'warning', True, 300, None),
                     ('performance', 'http_5xx_count', 1, '>=', 'critical', True, 60, None),
                     ('performance', 'error_rate_percent', 5, '>', 'warning', True, 300, None),
                     
                     # Database
-                    ('database', 'query_latency_ms', 3000, '>', 'warning', True, 300, None),
+                    ('database', 'query_latency_ms', 1000, '>', 'warning', True, 300, None),
                     ('database', 'connection_pool_percent', 80, '>', 'warning', True, 300, None),
                     
                     # Infrastructure
-                    ('infrastructure', 'cpu_percent', 80, '>', 'warning', True, 300, None),
-                    ('infrastructure', 'memory_percent', 80, '>', 'warning', True, 300, None),
+                    ('infrastructure', 'cpu_percent', 70, '>', 'warning', True, 300, None),
+                    ('infrastructure', 'memory_percent', 70, '>', 'warning', True, 300, None),
                     ('infrastructure', 'disk_percent', 80, '>', 'warning', True, 300, None),
                     
                     # Application
@@ -321,18 +335,20 @@ class MetricsCollector:
                 else:
                     uptime_percentage = 100.0
 
+                # Use threshold from config or default to 95.0
+                thresh = self.alert_rules.get('availability', {}).get('uptime_percentage', {}).get('threshold', 95.0)
                 metrics["metrics"]["uptime_percentage"] = {
                     "value": uptime_percentage,
-                    "threshold": 99.9
+                    "threshold": thresh
                 }
                 
-                if uptime_percentage < 99.9:
+                if uptime_percentage < thresh:
                     await self._trigger_alert(
                         category="availability",
                         metric_name="uptime_percentage",
                         severity="critical",
                         current_value=uptime_percentage,
-                        threshold=99.9
+                        threshold=thresh
                     )
 
         except Exception as e:
@@ -445,6 +461,10 @@ class MetricsCollector:
             {"name": "Netdata", "url": "http://localhost:19999/api/v1/info"},
         ]
         
+        # Get thresholds from config
+        perf_rules = self.alert_rules.get('performance', {})
+        page_load_thresh = perf_rules.get('page_load_time_ms', {}).get('threshold', 2000)
+        
         service_latencies = []
         for service in default_services:
             is_up, response_time = await self._check_service_health(service["url"])
@@ -452,8 +472,19 @@ class MetricsCollector:
                 service_latencies.append(response_time)
                 metrics["metrics"][f"{service['name']}_latency_ms"] = {
                     "value": response_time,
-                    "threshold": 2000
+                    "threshold": page_load_thresh
                 }
+                
+                # Trigger alert for each service if above threshold
+                if response_time > page_load_thresh:
+                    await self._trigger_alert(
+                        category="performance",
+                        metric_name="page_load_time_ms",
+                        severity="warning",
+                        current_value=response_time,
+                        threshold=page_load_thresh,
+                        metadata={"service": service['name'], "url": service['url']}
+                    )
         
         # Calculate min/max/avg from default services
         if service_latencies:
@@ -463,7 +494,7 @@ class MetricsCollector:
             }
             metrics["metrics"]["service_latency_max_ms"] = {
                 "value": max(service_latencies),
-                "threshold": 2000
+                "threshold": page_load_thresh
             }
             metrics["metrics"]["service_latency_avg_ms"] = {
                 "value": sum(service_latencies) / len(service_latencies),
@@ -645,56 +676,63 @@ class MetricsCollector:
             "metrics": {}
         }
         
-        # Get CPU usage
-        cpu_percent = await self._get_netdata_metric("system.cpu", aggregate=True)
+        # CPU Usage
+        cpu_percent = await self._get_cpu_usage_percent()
+        cpu_thresh = self.alert_rules.get('infrastructure', {}).get('cpu_percent', {}).get('threshold', 70)
         metrics["metrics"]["cpu_percent"] = {
             "value": cpu_percent,
-            "threshold": 80
+            "threshold": cpu_thresh
         }
         
-        if cpu_percent > 80:
+        if cpu_percent > cpu_thresh:
             await self._trigger_alert(
                 category="infrastructure",
                 metric_name="cpu_percent",
                 severity="warning",
                 current_value=cpu_percent,
-                threshold=80
+                threshold=cpu_thresh
             )
-        
-        # Get Memory usage
-        memory_percent = await self._get_memory_usage_percent()
+            
+        # Memory Usage
+        mem_percent = await self._get_memory_usage_percent()
+        mem_thresh = self.alert_rules.get('infrastructure', {}).get('memory_percent', {}).get('threshold', 70)
         metrics["metrics"]["memory_percent"] = {
-            "value": memory_percent,
-            "threshold": 80
+            "value": mem_percent,
+            "threshold": mem_thresh
         }
         
-        if memory_percent > 80:
+        if mem_percent > mem_thresh:
             await self._trigger_alert(
                 category="infrastructure",
                 metric_name="memory_percent",
                 severity="warning",
-                current_value=memory_percent,
-                threshold=80
+                current_value=mem_percent,
+                threshold=mem_thresh
             )
         
-        # Get Disk usage
+        # Disk Usage
         disk_percent = await self._get_disk_usage_percent()
+        disk_thresh = self.alert_rules.get('infrastructure', {}).get('disk_percent', {}).get('threshold', 80)
         metrics["metrics"]["disk_percent"] = {
             "value": disk_percent,
-            "threshold": 80
+            "threshold": disk_thresh
         }
         
-        if disk_percent > 80:
+        if disk_percent > disk_thresh:
             await self._trigger_alert(
                 category="infrastructure",
                 metric_name="disk_percent",
                 severity="warning",
                 current_value=disk_percent,
-                threshold=80
+                threshold=disk_thresh
             )
         
         await self._store_metrics(metrics)
         return metrics
+    
+    async def _get_cpu_usage_percent(self) -> float:
+        """Get CPU usage percentage from Netdata"""
+        return await self._get_netdata_metric("system.cpu", aggregate=True)
     
     async def _get_netdata_metric(self, chart: str, aggregate: bool = False) -> float:
         """Get metric value from Netdata"""
@@ -705,9 +743,10 @@ class MetricsCollector:
                 if data.get('data') and len(data['data']) > 0:
                     values = data['data'][0][1:]  # Skip timestamp
                     if aggregate:
-                        return sum(abs(v) for v in values if v is not None)
-                    return values[0] if values else 0
-        except:
+                        return sum(abs(v) if v is not None else 0 for v in values)
+                    return values[0] if values and values[0] is not None else 0
+        except Exception as e:
+            print(f"Netdata error for {chart}: {e}")
             return 0
         return 0
     

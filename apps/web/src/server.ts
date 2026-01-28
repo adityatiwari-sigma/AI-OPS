@@ -80,7 +80,7 @@ app.post('/api/alerts/:id/approve', async (c) => {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         title: `Alert Remediation: ${body.metric_name}`,
-        description: `User approved remediation for alert ${body.alert_id}`,
+        description: body.description || `User approved remediation for alert ${body.alert_id}`,
         severity: body.severity || "MEDIUM",
         alert_id: body.alert_id,
         remediation_plan: body.remediation
@@ -96,9 +96,20 @@ app.post('/api/alerts/:id/approve', async (c) => {
 // API: Reject Remediation
 app.post('/api/alerts/:id/reject', async (c) => {
   try {
-    // For now just acknowledge the alert? Or log rejection?
-    // We'll just return success for UI feedback
-    return c.json({ status: "rejected" })
+    const alertId = c.req.param('id')
+    const body = await c.req.json().catch(() => ({}))
+    const response = await fetch('http://localhost:8000/api/reject-alert', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        alert_id: alertId,
+        metric_name: body.metric_name,
+        reason: body.reason || 'User rejected remediation',
+        description: body.description // Pass through AI diagnosis
+      })
+    })
+    const data = await response.json()
+    return c.json(data)
   } catch (error) {
     return c.json({ error: 'Failed to reject' }, 500)
   }
@@ -1606,15 +1617,16 @@ const dashboardHTML = `<!DOCTYPE html>
           <table class="process-table">
             <thead>
               <tr>
-                <th>Date</th>
-                <th>Alert Topic</th>
-                <th>Remediation Step</th>
+                <th>#</th>
+                <th>Name</th>
+                <th>Description</th>
+                <th>Remediation</th>
                 <th>Status</th>
               </tr>
             </thead>
             <tbody id="alertHistoryBody">
               <tr>
-                <td colspan="4" style="text-align: center; color: var(--text-muted);">Loading history...</td>
+                <td colspan="5" style="text-align: center; color: var(--text-muted);">Loading history...</td>
               </tr>
             </tbody>
           </table>
@@ -1874,25 +1886,26 @@ const dashboardHTML = `<!DOCTYPE html>
         if (!res.ok) throw new Error('API error: ' + res.status);
         
         const data = await res.json();
-        const alerts = Object.values(data.alarms || {});
+        // Brain consolidated format returns { active: [], history: [] }
+        const alerts = data.active || [];
         
         document.getElementById('alertsCount').textContent = alerts.length;
         
         if (alerts.length === 0) {
           list.innerHTML = '<div class="alert-row" style="justify-content: center; color: var(--accent);">✓ All systems normal</div>';
-        }else {
+        } else {
           list.innerHTML = alerts.map(a => \`
             <div class="alert-row">
-              <div class="alert-severity \${a.status === 'CRITICAL' ? 'critical' : 'warning'}"></div>
+              <div class="alert-severity \${a.severity === 'CRITICAL' ? 'critical' : 'warning'}"></div>
               <div class="alert-content">
-                <div class="alert-name">\${a.name}</div>
-                <div class="alert-meta">\${a.chart}• \${a.status}</div>
+                <div class="alert-name">\${a.metric_name}</div>
+                <div class="alert-meta">\${a.category || ''} • \${a.severity} • \${new Date(a.triggered_at).toLocaleTimeString()}</div>
               </div>
-              <button class="btn btn-sm" onclick="diagnoseAlert('\${a.name}')">Diagnose</button>
+              <button class="btn btn-sm" onclick="showTab('alerts')">Details</button>
             </div>
           \`).join('');
         }
-      }catch (e) {
+      } catch (e) {
         console.error('Alerts fetch error:', e);
         list.innerHTML = '<div class="alert-row" style="justify-content: center; color: var(--error);">⚠ Failed to load alerts</div>';
         document.getElementById('alertsCount').textContent = '?';
@@ -2928,7 +2941,7 @@ const dashboardHTML = `<!DOCTYPE html>
                   '<div style="font-size: 12px; font-weight: 600; margin-bottom: 4px;">Recommended Remediation:</div>' +
                   '<div class="remediation-text" style="font-size: 13px; color: var(--text-primary); margin-bottom: 12px; font-style: italic;"></div>' +
                   '<div style="display: flex; gap: 8px;">' +
-                    '<button class="btn btn-sm" style="background: var(--success); border-color: var(--success); color: white;" onclick="approveRemediation(\\'' + alertId + '\\')">Approve Fix</button>' +
+                    '<button class="btn btn-sm" style="background: var(--accent); border-color: var(--accent); color: white;" onclick="approveRemediation(\\'' + alertId + '\\')">Approve Fix</button>' +
                     '<button class="btn btn-sm btn-outline" style="color: var(--error); border-color: var(--error);" onclick="rejectRemediation(\\'' + alertId + '\\')">Reject</button>' +
                   '</div>' +
                 '</div>' +
@@ -2945,22 +2958,34 @@ const dashboardHTML = `<!DOCTYPE html>
         
         // Render History
         if (data.history && data.history.length > 0) {
-          historyBody.innerHTML = data.history.map(function(alert) {
-            const timestamp = new Date(alert.resolved_at || alert.triggered_at).toLocaleString();
-            const remediation = (alert.metadata && alert.metadata.remediation) || 'N/A';
-            const status = alert.status || (alert.resolved ? 'Closed' : 'Open');
-            const statusColors = { 'Closed': 'var(--success)', 'Open': 'var(--warning)', 'In-progress': 'var(--accent)' };
+          historyBody.innerHTML = data.history.map(function(alert, index) {
+            const name = alert.metric_name || alert.name || 'Unknown';
+            const description = alert.description || 'N/A';
+            
+            // Handle remediation display (can be string, object, or array)
+            let remediation = alert.remediation_proposed || 'N/A';
+            if (typeof remediation === 'object') {
+              if (Array.isArray(remediation)) {
+                remediation = remediation.map(r => typeof r === 'object' ? (r.description || JSON.stringify(r)) : String(r)).join('; ');
+              } else {
+                remediation = remediation.description || JSON.stringify(remediation);
+              }
+            }
+            
+            const status = alert.status || 'Unknown';
+            const statusColors = { 'Approved': 'var(--accent)', 'Rejected': 'var(--error)', 'Closed': 'var(--success)', 'Open': 'var(--warning)', 'In-progress': 'var(--accent)' };
             const statusColor = statusColors[status] || 'var(--text-muted)';
             
             return '<tr>' +
-              '<td style="color: var(--text-muted); font-size: 12px;">' + timestamp + '</td>' +
-              '<td style="font-weight: 500;">' + alert.metric_name + '</td>' +
-              '<td style="color: var(--text-secondary);">' + remediation + '</td>' +
+              '<td style="color: var(--text-muted); font-size: 12px;">' + (index + 1) + '</td>' +
+              '<td style="font-weight: 500;">' + name + '</td>' +
+              '<td style="color: var(--text-secondary); max-width: 250px; overflow: hidden; text-overflow: ellipsis; white-space: pre-wrap;" title="' + description + '">' + description + '</td>' +
+              '<td style="color: var(--text-secondary); max-width: 250px; overflow: hidden; text-overflow: ellipsis; white-space: pre-wrap;" title="' + remediation + '">' + remediation + '</td>' +
               '<td><span style="color: ' + statusColor + '; font-weight: 600;">' + status + '</span></td>' +
             '</tr>';
           }).join('');
         } else {
-          historyBody.innerHTML = '<tr><td colspan="4" style="text-align: center; color: var(--text-muted);">No alert history found</td></tr>';
+          historyBody.innerHTML = '<tr><td colspan="5" style="text-align: center; color: var(--text-muted);">No alert history found</td></tr>';
         }
       } catch (e) {
         console.error('Failed to load alerts:', e);
@@ -2985,12 +3010,18 @@ const dashboardHTML = `<!DOCTYPE html>
         });
         const data = await res.json();
         
-        diagDiv.dataset.remediation = data.remediation || 'Check manual logs';
+        // Handle object/string for remediation/analysis
+        const remediation = typeof data.remediation === 'object' ? JSON.stringify(data.remediation) : String(data.remediation || 'Investigate manually');
+        const analysis = typeof data.analysis === 'object' ? JSON.stringify(data.analysis) : String(data.analysis || 'AI diagnosis complete');
+        
+        diagDiv.dataset.remediation = remediation;
+        diagDiv.dataset.analysis = analysis;
         diagDiv.dataset.severity = severity;
         diagDiv.dataset.metric = metric;
         
-        diagDiv.querySelector('.diagnosis-content').textContent = data.analysis || 'No analysis provided';
-        diagDiv.querySelector('.remediation-text').textContent = data.remediation || 'Investigate manually';
+        // Update UI display
+        diagDiv.querySelector('.diagnosis-content').textContent = analysis.substring(0, 500) + (analysis.length > 500 ? '...' : '');
+        diagDiv.querySelector('.remediation-text').textContent = remediation.substring(0, 300) + (remediation.length > 300 ? '...' : '');
         
         if (btnDiv) btnDiv.style.display = 'none';
       } catch (e) {
@@ -3006,7 +3037,13 @@ const dashboardHTML = `<!DOCTYPE html>
         await fetch('/api/alerts/' + id + '/approve', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ alert_id: id, remediation: diagDiv.dataset.remediation })
+          body: JSON.stringify({ 
+            alert_id: id, 
+            remediation: diagDiv.dataset.remediation,
+            description: diagDiv.dataset.analysis, // Pass AI diagnosis as description
+            metric_name: diagDiv.dataset.metric || 'Unknown Alert',
+            severity: diagDiv.dataset.severity || 'MEDIUM'
+          })
         });
         alert('Remediation approved!');
         setTimeout(loadAlerts, 1000);
@@ -3018,11 +3055,19 @@ const dashboardHTML = `<!DOCTYPE html>
     
     window.rejectRemediation = async function(id) {
       if (!confirm('Reject this remediation plan?')) return;
+      const diagDiv = document.getElementById('diagnosis-' + id);
       
       try {
-        await fetch('/api/alerts/' + id + '/reject', { method: 'POST' });
-        document.getElementById('diagnosis-' + id).style.display = 'none';
-        document.getElementById('actions-' + id).style.display = 'flex';
+        await fetch('/api/alerts/' + id + '/reject', { 
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ 
+            alert_id: id,
+            reason: diagDiv ? diagDiv.dataset.remediation : 'User rejected remediation',
+            description: diagDiv ? diagDiv.dataset.analysis : 'Alert rejected'
+          })
+        });
+        setTimeout(loadAlerts, 500);
       } catch (e) { console.error(e); }
     };
     

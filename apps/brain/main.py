@@ -64,6 +64,10 @@ async def init_db():
     try:
         db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=2, max_size=10)
         
+        # Initialize incident manager with the pool
+        incident_manager.db_pool = db_pool
+        await incident_manager._ensure_tables()
+        
         async with db_pool.acquire() as conn:
             # Create tables
             await conn.execute('''
@@ -1096,10 +1100,10 @@ async def get_active_alerts():
                 ORDER BY triggered_at DESC
             """)
             
-            # Fetch recent history (resolved alerts)
+            # Fetch recent history from resolved_alerts table
             history_rows = await conn.fetch("""
-                SELECT * FROM active_alerts 
-                WHERE resolved = TRUE 
+                SELECT id, name as metric_name, description, remediation_proposed, status, resolved_at as triggered_at
+                FROM resolved_alerts 
                 ORDER BY resolved_at DESC 
                 LIMIT 50
             """)
@@ -1108,11 +1112,14 @@ async def get_active_alerts():
             active = [dict(r) for r in active_rows]
             history = [dict(r) for r in history_rows]
             
-            # Format dates isoformat
+            # Format dates isoformat and UUIDs to strings
+            import uuid as uuid_module
             for r in active + history:
-                for k, v in r.items():
+                for k, v in list(r.items()):
                     if isinstance(v, datetime):
                         r[k] = v.isoformat()
+                    elif isinstance(v, uuid_module.UUID):
+                        r[k] = str(v)
             
             return {
                 "active": active, 
@@ -1183,13 +1190,58 @@ class IncidentCreateRequest(BaseModel):
     alert_id: Optional[str] = None
     remediation_plan: Optional[str] = None
 
-@app.post("/api/create-incident")
-async def create_incident_endpoint(request: IncidentCreateRequest):
-    """Create a new incident from an alert"""
+class RejectAlertRequest(BaseModel):
+    alert_id: str
+    metric_name: Optional[str] = None
+    reason: Optional[str] = None
+    description: Optional[str] = None
+
+@app.post("/api/reject-alert")
+async def reject_alert_endpoint(request: RejectAlertRequest):
+    """Reject a remediation and move alert to history"""
     if not db_pool:
         await init_db()
         
     try:
+        async with db_pool.acquire() as conn:
+            # 1. Get alert details for history
+            alert_row = await conn.fetchrow("""
+                SELECT metric_name, current_value, threshold, category
+                FROM active_alerts WHERE id = $1::uuid
+            """, request.alert_id)
+            
+            # 2. Insert into resolved_alerts as rejected (Alert History)
+            await conn.execute("""
+                INSERT INTO resolved_alerts (name, description, remediation_proposed, status, original_alert_id, metadata)
+                VALUES ($1, $2, $3, 'Rejected', $4::uuid, $5)
+            """, 
+                request.metric_name or (alert_row['metric_name'] if alert_row else 'Unknown'),
+                request.description or (f"Value: {alert_row['current_value'] if alert_row else 'N/A'}" if alert_row else 'Alert rejected by user'),
+                request.reason or 'User rejected remediation',
+                request.alert_id,
+                json.dumps({"category": alert_row['category'] if alert_row else 'unknown', "rejected": True}))
+            
+            # 3. Mark active alert as resolved
+            await conn.execute("""
+                UPDATE active_alerts 
+                SET resolved = TRUE, resolved_at = NOW() 
+                WHERE id = $1::uuid
+            """, request.alert_id)
+        
+        print(f"❌ Alert {request.alert_id} rejected and moved to history")
+        return {"status": "rejected", "alert_id": request.alert_id}
+    except Exception as e:
+        print(f"Reject error: {e}")
+        return {"status": "error", "message": str(e)}
+
+@app.post("/api/create-incident")
+async def create_incident_endpoint(request: IncidentCreateRequest):
+    """Create a new incident from an alert and log to history"""
+    if not db_pool:
+        await init_db()
+        
+    try:
+        # 1. Create the incident
         incident_id = await incident_manager.create_incident(
             title=request.title,
             description=request.description,
@@ -1197,37 +1249,50 @@ async def create_incident_endpoint(request: IncidentCreateRequest):
             source="User Approved Alert"
         )
         
-        # If there's a remediation plan, add it to the incident
+        # 2. Add remediation plan to timeline if exists
         if request.remediation_plan:
              await incident_manager.add_timeline_event(
                  incident_id, 
                  "Remediation Approved", 
                  request.remediation_plan
              )
-             
-             # In a real system, we might execute an action here
-             # For now, just mark it as approved/in-progress
              await incident_manager.update_status(incident_id, "MITIGATING", "Remediation plan approved by user")
         
-        # Mark alert as resolved in active_alerts if alert_id is provided
+        # 3. Mark alert as resolved and log to history
         if request.alert_id:
              async with db_pool.acquire() as conn:
                 try:
+                    # Get alert details before resolving (as fallback for missing info)
+                    alert_row = await conn.fetchrow("""
+                        SELECT metric_name, severity, current_value, threshold, category
+                        FROM active_alerts WHERE id = $1::uuid
+                    """, request.alert_id)
+                    
+                    # Log to resolved_alerts (Alert History)
                     await conn.execute("""
-                        UPDATE active_alerts 
-                        SET resolved = TRUE, resolved_at = NOW() 
-                        WHERE id = $1
-                    """, request.alert_id) # ID should be UUID type? Let asyncpg handle it or cast
-                except:
-                    # Try with UUID cast if string fails
+                        INSERT INTO resolved_alerts (name, description, remediation_proposed, status, original_alert_id, metadata)
+                        VALUES ($1, $2, $3, 'Approved', $4::uuid, $5)
+                    """, 
+                        request.title or (alert_row['metric_name'] if alert_row else 'Unknown'),
+                        request.description or (f"Value: {alert_row['current_value']}, Threshold: {alert_row['threshold']}" if alert_row else 'Remediation approved'),
+                        request.remediation_plan or 'N/A',
+                        request.alert_id,
+                        json.dumps({"incident_id": incident_id, "category": alert_row['category'] if alert_row else 'unknown'}))
+                    
+                    # Mark active alert as resolved
                     await conn.execute("""
                         UPDATE active_alerts 
                         SET resolved = TRUE, resolved_at = NOW() 
                         WHERE id = $1::uuid
                     """, request.alert_id)
+                    
+                    print(f"✅ Alert {request.alert_id} approved and moved to history")
+                except Exception as e:
+                    print(f"Error resolving alert during incident creation: {e}")
 
-        return {"incident_id": incident_id, "status": "created"}
+        return {"incident_id": incident_id, "status": "created", "alert_history": "logged"}
     except Exception as e:
+        print(f"❌ Failed to create incident: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to create incident: {str(e)}")
 
 
