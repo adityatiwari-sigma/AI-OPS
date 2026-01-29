@@ -14,6 +14,7 @@ import asyncpg
 import aiohttp
 from collections import defaultdict
 from incident_manager import incident_manager
+from pipeline_simulator import PipelineSimulator
 
 # Configuration
 NETDATA_URL = os.getenv("NETDATA_URL", "http://localhost:19999")
@@ -66,6 +67,7 @@ class MetricsCollector:
         self.error_cache = defaultdict(int)  # Track error signatures
         self.service_health = {}  # Track service health status
         self.alert_rules = {}  # Cache for thresholds and rules
+        self.pipeline_sim = PipelineSimulator()
         
     async def initialize(self):
         """Initialize database connection and HTTP session"""
@@ -210,6 +212,11 @@ class MetricsCollector:
                     
                     # Incidents
                     ('incidents', 'consecutive_failures', 3, '>=', 'critical', True, 300, None),
+                    
+                    # Pipeline
+                    ('pipeline', 'pipeline_status', 1, '<', 'critical', True, 60, None),
+                    ('pipeline', 'pipeline_latency', 2000, '>', 'warning', True, 300, None),
+                    ('pipeline', 'pipeline_errors', 5, '>', 'warning', True, 300, None),
                 ]
                 
                 await conn.executemany("""
@@ -1140,15 +1147,81 @@ class MetricsCollector:
         await self._store_metrics(metrics)
         return metrics
         
-    async def _get_requests_per_second(self) -> int:
-        """Get current RPS from Netdata or logs"""
-        # Placeholder simulation
-        return await self._get_netdata_metric("web_log.requests", aggregate=True)
-
     async def _count_failed_logins(self) -> int:
         """Count recent failed login attempts"""
         # Placeholder simulation
         return 0
+
+    # ============================================================
+    # 8. PIPELINE METRICS
+    # ============================================================
+    
+    async def collect_pipeline_metrics(self) -> Dict[str, Any]:
+        """Monitor website CI/CD pipeline states"""
+        metrics = {
+            "category": "pipeline",
+            "timestamp": datetime.utcnow().isoformat(),
+            "metrics": {}
+        }
+        
+        state = self.pipeline_sim.get_state()
+        
+        # Pipeline Status (1 = Healthy, 0 = Failed)
+        is_healthy = 1 if state["stages"]["build"] == "success" and state["stages"]["test"] == "success" and state["stages"]["deploy"] == "success" else 0
+        metrics["metrics"]["pipeline_status"] = {
+            "value": is_healthy,
+            "threshold": 1,
+            "mode": state["mode"],
+            "stages": state["stages"]
+        }
+        
+        if is_healthy == 0:
+            failed_stage = next((stage for stage, status in state["stages"].items() if status == "failed"), "unknown")
+            await self._trigger_alert(
+                category="pipeline",
+                metric_name="pipeline_status",
+                severity="critical",
+                current_value=0,
+                threshold=1,
+                metadata={"mode": state["mode"], "failed_stage": failed_stage}
+            )
+            
+        # Pipeline Latency
+        latency = state["metrics"]["latency_ms"]
+        metrics["metrics"]["pipeline_latency"] = {
+            "value": latency,
+            "threshold": 2000
+        }
+        
+        if latency > 2000:
+            await self._trigger_alert(
+                category="pipeline",
+                metric_name="pipeline_latency",
+                severity="warning",
+                current_value=latency,
+                threshold=2000,
+                metadata={"mode": state["mode"]}
+            )
+            
+        # Pipeline Errors
+        errors = state["metrics"]["error_rate"]
+        metrics["metrics"]["pipeline_errors"] = {
+            "value": errors,
+            "threshold": 5
+        }
+        
+        if errors > 5:
+            await self._trigger_alert(
+                category="pipeline",
+                metric_name="pipeline_errors",
+                severity="warning",
+                current_value=errors,
+                threshold=5,
+                metadata={"mode": state["mode"]}
+            )
+            
+        await self._store_metrics(metrics)
+        return metrics
 
     async def get_all_metrics_summary(self) -> Dict:
         """Get summary of all metric categories"""
@@ -1165,6 +1238,7 @@ class MetricsCollector:
         summary["categories"]["application"] = await self.collect_application_metrics()
         summary["categories"]["security"] = await self.collect_security_metrics()
         summary["categories"]["incidents"] = await self.collect_incident_metrics()
+        summary["categories"]["pipeline"] = await self.collect_pipeline_metrics()
         
         # Get active alerts count
         async with self.db_pool.acquire() as conn:

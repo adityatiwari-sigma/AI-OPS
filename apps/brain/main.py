@@ -500,6 +500,8 @@ async def run_metrics_collection():
             await metrics_collector.collect_application_metrics()
             await asyncio.sleep(1)
             await metrics_collector.collect_incident_metrics()
+            await asyncio.sleep(1)
+            await metrics_collector.collect_pipeline_metrics()
             
             # Wait before next round (collect every 10 seconds)
             await asyncio.sleep(4)
