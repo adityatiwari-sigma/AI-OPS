@@ -1,0 +1,187 @@
+---
+# Production Emergency Response Playbook
+# Immediate triage and escalation for critical production failures
+
+- name: Production Emergency Response
+  hosts: "{{ target_host | default('localhost') }}"
+  gather_facts: true
+  vars:
+    callback_url: "{{ callback | default('http://localhost:8000/automation/callback') }}"
+    action_id: "{{ action_id | default('unknown') }}"
+    severity: "{{ sev | default('P0') }}"
+
+  tasks:
+    - name: Report emergency start
+      uri:
+        url: "{{ callback_url }}"
+        method: POST
+        body_format: json
+        body:
+          action_id: "{{ action_id }}"
+          status: "running"
+          message: "⚠️ PRODUCTION EMERGENCY - Initiating immediate response"
+      ignore_errors: true
+
+    # 1. Immediate escalation notification
+    - name: Log emergency escalation
+      debug:
+        msg: "🚨 P0 PRODUCTION EMERGENCY - All hands on deck"
+
+    # 2. Capture complete system snapshot
+    - name: Capture running processes
+      command: "ps auxf"
+      register: process_snapshot
+      ignore_errors: true
+      changed_when: false
+
+    - name: Capture network connections
+      command: "netstat -tuln"
+      register: network_snapshot
+      ignore_errors: true
+      changed_when: false
+
+    - name: Capture disk usage
+      command: "df -h"
+      register: disk_snapshot
+      ignore_errors: true
+      changed_when: false
+
+    - name: Capture memory usage
+      command: "free -h"
+      register: memory_snapshot
+      ignore_errors: true
+      changed_when: false
+
+    - name: Capture system load
+      command: "uptime"
+      register: load_snapshot
+      ignore_errors: true
+      changed_when: false
+
+    # 3. Check all critical services
+    - name: Check database service
+      command: "systemctl is-active postgresql"
+      register: db_status
+      ignore_errors: true
+      changed_when: false
+
+    - name: Check web server
+      command: "systemctl is-active nginx"
+      register: web_status
+      ignore_errors: true
+      changed_when: false
+
+    - name: Check application service
+      command: "systemctl is-active gunicorn"
+      register: app_status
+      ignore_errors: true
+      changed_when: false
+
+    - name: Critical services status
+      debug:
+        msg:
+          - "Database: {{ db_status.stdout }}"
+          - "Web server: {{ web_status.stdout }}"
+          - "Application: {{ app_status.stdout }}"
+
+    # 4. Identify failed/degraded services
+    - name: List all failed services
+      shell: "systemctl --failed --no-pager"
+      register: failed_services
+      ignore_errors: true
+      changed_when: false
+
+    - name: Failed services
+      debug:
+        msg: "{{ failed_services.stdout_lines }}"
+
+    # 5. Check recent system logs
+    - name: Get critical system errors (last 5 minutes)
+      shell: "journalctl --since '5 minutes ago' -p err -n 50 --no-pager"
+      register: recent_errors
+      ignore_errors: true
+      changed_when: false
+
+    - name: Critical errors found
+      debug:
+        msg: "{{ recent_errors.stdout_lines | length }} critical errors in last 5 minutes"
+
+    # 6. Check for out of memory or disk space
+    - name: Check OOM events
+      shell: "dmesg | grep -i 'out of memory' | tail -5"
+      register: oom_check
+      ignore_errors: true
+      changed_when: false
+
+   - name: Check disk space critical
+      shell: "df -h | awk '$5+0 > 90 {print $0}'"
+      register: disk_critical
+      ignore_errors: true
+      changed_when: false
+
+    - name: Resource exhaustion check
+      debug:
+        msg:
+          - "OOM events: {{ oom_check.stdout_lines | length }}"
+          - "Critical disk usage: {{ disk_critical.stdout_lines }}"
+
+    # 7. Emergency incident creation (via callback)
+    - name: Create emergency incident
+      uri:
+        url: "{{ callback_url }}"
+        method: POST
+        body_format: json
+        body:
+          action_id: "{{ action_id }}"
+          status: "incident_created"
+          severity: "P0_CRITICAL"
+          message: "Emergency incident created - awaiting human decision"
+          snapshot:
+            failed_services: "{{ failed_services.stdout_lines[:5] }}"
+            critical_errors: "{{ recent_errors.stdout_lines[:10] }}"
+            oom_detected: "{{ oom_check.stdout_lines | length > 0 }}"
+            disk_critical: "{{ disk_critical.stdout_lines | length > 0 }}"
+            service_status:
+              database: "{{ db_status.stdout }}"
+              web: "{{ web_status.stdout }}"
+              app: "{{ app_status.stdout }}"
+      ignore_errors: true
+
+    # 8. Await human decision
+    - name: Log awaiting approval
+      debug:
+        msg: "⏳ Emergency response playbook completed - awaiting human approval for remediation actions"
+
+    # 9. Compile emergency report
+    - name: Build emergency diagnostic report
+      set_fact:
+        emergency_report:
+          severity: "P0_CRITICAL"
+          failed_services: "{{ failed_services.stdout_lines[:5] }}"
+          critical_errors_count: "{{ recent_errors.stdout_lines | length }}"
+          system_load: "{{ load_snapshot.stdout }}"
+          memory_usage: "{{ memory_snapshot.stdout_lines[1] }}"
+          disk_usage_critical: "{{ disk_critical.stdout_lines }}"
+          oom_detected: "{{ oom_check.stdout_lines | length > 0 }}"
+          services_status:
+            database: "{{ db_status.stdout }}"
+            web_server: "{{ web_status.stdout }}"
+            application: "{{ app_status.stdout }}"
+          immediate_actions_needed:
+            - "{{ 'Restart failed services' if failed_services.stdout_lines | length > 1 else 'All services running' }}"
+            - "{{ 'Clear disk space immediately' if disk_critical.stdout_lines | length > 0 else 'Disk space adequate' }}"
+            - "{{ 'Investigate OOM killer activity' if oom_check.stdout_lines | length > 0 else 'No OOM detected' }}"
+          escalation: "Page on-call engineer, notify engineering manager, start war room"
+
+    - name: Report emergency analysis
+      uri:
+        url: "{{ callback_url }}"
+        method: POST
+        body_format: json
+        body:
+          action_id: "{{ action_id }}"
+          status: "completed"
+          success: true
+          message: "🚨 Production emergency diagnostic completed - REQUIRES IMMEDIATE ATTENTION"
+          details: "{{ emergency_report }}"
+      ignore_errors: true

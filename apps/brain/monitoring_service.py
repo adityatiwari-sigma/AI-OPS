@@ -17,7 +17,7 @@ from incident_manager import incident_manager
 from pipeline_simulator import PipelineSimulator
 
 # Configuration
-NETDATA_URL = os.getenv("NETDATA_URL", "http://localhost:19999")
+NETDATA_URL = os.getenv("NETDATA_URL", "http://localhost:19998")
 DATABASE_URL = os.getenv("DATABASE_URL", "postgres://aiops:aiops_password@localhost:5432/peekaping")
 
 # Thresholds from requirements
@@ -80,6 +80,16 @@ class MetricsCollector:
             print("✅ Monitoring service initialized")
         except Exception as e:
             print(f"❌ Monitoring service initialization error: {e}")
+
+    def _round_val(self, val):
+        """Helper to round numeric values to 3 decimal places"""
+        if isinstance(val, (int, float)):
+            return round(float(val), 3)
+        if isinstance(val, dict):
+            return {k: self._round_val(v) for k, v in val.items()}
+        if isinstance(val, list):
+            return [self._round_val(v) for v in val]
+        return val
     
     async def close(self):
         """Cleanup resources"""
@@ -269,7 +279,7 @@ class MetricsCollector:
         default_services = [
             {"name": "Frontend", "url": "http://localhost:3001"},
             {"name": "Brain", "url": "http://localhost:8000/health"},
-            {"name": "Netdata", "url": "http://localhost:19999/api/v1/info"},
+            {"name": "Netdata", "url": "http://localhost:19998/api/v1/info"},
         ]
         
         for service in default_services:
@@ -364,7 +374,7 @@ class MetricsCollector:
                 
                 total_checks = (uptime_stats['total_up'] or 0) + (uptime_stats['total_down'] or 0)
                 if total_checks > 0:
-                    uptime_percentage = (uptime_stats['total_up'] / total_checks) * 100
+                    uptime_percentage = round((uptime_stats['total_up'] / total_checks) * 100, 3)
                 else:
                     uptime_percentage = 100.0
 
@@ -491,7 +501,7 @@ class MetricsCollector:
         default_services = [
             {"name": "Frontend", "url": "http://localhost:3001"},
             {"name": "Brain", "url": "http://localhost:8000/health"},
-            {"name": "Netdata", "url": "http://localhost:19999/api/v1/info"},
+            {"name": "Netdata", "url": "http://localhost:19998/api/v1/info"},
         ]
         
         # Get thresholds from config
@@ -530,7 +540,7 @@ class MetricsCollector:
                 "threshold": page_load_thresh
             }
             metrics["metrics"]["page_load_latency_avg_ms"] = {
-                "value": sum(service_latencies) / len(service_latencies),
+                "value": round(sum(service_latencies) / len(service_latencies), 3),
                 "threshold": 1000
             }
         
@@ -605,7 +615,7 @@ class MetricsCollector:
                     )
                 
                 # Calculate error rate
-                error_rate = (http_5xx_count / total_checks * 100) if total_checks > 0 else 0.0
+                error_rate = round((http_5xx_count / total_checks * 100), 3) if total_checks > 0 else 0.0
                 metrics["metrics"]["error_rate_percent"] = {
                     "value": error_rate,
                     "threshold": 5
@@ -684,7 +694,7 @@ class MetricsCollector:
                 # Run a real query (count items in history)
                 await conn.fetchval("SELECT COUNT(*) FROM metrics_history")
                 latency = (time.perf_counter() - start) * 1000
-                return round(latency, 2)
+                return round(latency, 3)
         except Exception as e:
             print(f"Error measuring query latency: {e}")
             return 9999.0
@@ -776,8 +786,8 @@ class MetricsCollector:
                 if data.get('data') and len(data['data']) > 0:
                     values = data['data'][0][1:]  # Skip timestamp
                     if aggregate:
-                        return sum(abs(v) if v is not None else 0 for v in values)
-                    return values[0] if values and values[0] is not None else 0
+                        return round(sum(abs(v) if v is not None else 0 for v in values), 3)
+                    return round(values[0], 3) if values and values[0] is not None else 0
         except Exception as e:
             print(f"Netdata error for {chart}: {e}")
             return 0
@@ -790,12 +800,11 @@ class MetricsCollector:
             async with self.session.get(url) as resp:
                 data = await resp.json()
                 if data.get('data') and len(data['data']) > 0:
+                    # Labels: [time, free, used, cached, buffers]
                     values = data['data'][0][1:]
                     total = sum(abs(v) for v in values if v is not None)
-                    free = abs(values[0]) if len(values) > 0 else 0
-                    # Standard "Used" = Total - Free (includes cache/buffers)
-                    used = total - free
-                    return round((used / total * 100), 2) if total > 0 else 0
+                    used = abs(values[1]) if len(values) > 1 else 0  # Actual 'used' memory
+                    return round((used / total * 100), 3) if total > 0 else 0
         except:
             return 0
         return 0
@@ -956,9 +965,12 @@ class MetricsCollector:
                 await self._refresh_alert_rules()
                 
             for metric_name, metric_value in metrics_data["metrics"].items():
-                value = metric_value.get("value", 0)
-                threshold = metric_value.get("threshold")
+                value = self._round_val(metric_value.get("value", 0))
+                threshold = self._round_val(metric_value.get("threshold"))
                 severity = metric_value.get("severity") 
+                
+                # Round everything in the metadata dictionary too
+                rounded_metadata = self._round_val(metric_value)
                 
                 # Try to look up severity if missing
                 if not severity:
@@ -971,7 +983,7 @@ class MetricsCollector:
                     INSERT INTO metrics_history 
                     (category, metric_name, value, threshold, severity, metadata)
                     VALUES ($1, $2, $3, $4, $5, $6)
-                """, metrics_data["category"], metric_name, value, threshold, severity, json.dumps(metric_value))
+                """, metrics_data["category"], metric_name, value, threshold, severity, json.dumps(rounded_metadata))
     
     async def _trigger_alert(self, category: str, metric_name: str, severity: str, 
                             current_value: float, threshold: float, metadata: dict = None):
@@ -985,12 +997,17 @@ class MetricsCollector:
             """, category, metric_name)
             
             if not existing:
+                # Round current value and threshold for storage
+                current_value = self._round_val(current_value)
+                threshold = self._round_val(threshold)
+                rounded_metadata = self._round_val(metadata or {})
+                
                 # Create new alert
                 await conn.execute("""
                     INSERT INTO active_alerts 
                     (category, metric_name, severity, threshold, current_value, metadata)
                     VALUES ($1, $2, $3, $4, $5, $6)
-                """, category, metric_name, severity, threshold, current_value, json.dumps(metadata or {}))
+                """, category, metric_name, severity, threshold, current_value, json.dumps(rounded_metadata))
                 
                 print(f"🚨 ALERT: {severity.upper()} - {category}/{metric_name} = {current_value} (threshold: {threshold})")
                 print(f"📧 Sending notification to: {{{{ALERT_EMAIL}}}}")
@@ -1277,6 +1294,44 @@ class MetricsCollector:
                 SET resolved = TRUE, resolved_at = NOW()
                 WHERE id = $1
             """, alert_id)
+
+    async def create_incident_from_alert(self, alert_id: str, category: str,
+                                         metric_name: str, severity: str, metadata: dict):
+        """Create incident from critical alert with automatic type detection"""
+        try:
+            from incident_manager import incident_manager
+            from incident_types import detect_incident_type_from_alert, get_incident_config
+            
+            incident_type = detect_incident_type_from_alert(category, metric_name, severity)
+            incident_type_str = incident_type.value if incident_type else "unknown"
+            config = get_incident_config(incident_type) if incident_type else None
+            
+            title = f"{category.upper()} Alert: {metric_name}"
+            description = f"Alert triggered: {metric_name} (severity: {severity})"
+            if metadata:
+                description += f"\n\nDetails: {json.dumps(metadata, indent=2)}"
+            
+            response_sla = config.response_sla_minutes if config else 15
+            resolution_sla = config.resolution_sla_minutes if config else 60
+            
+            incident_id = await incident_manager.create_incident(
+                title=title,
+                description=description,
+                severity=severity.upper(),
+                source=f"Alert:{alert_id}",
+                incident_type=incident_type_str,
+                response_sla_minutes=response_sla,
+                resolution_sla_minutes=resolution_sla
+            )
+            
+            # Auto-triage
+            await incident_manager.triage_incident(incident_id)
+            
+            print(f"📋 Incident {incident_id[:8]} created from alert (type: {incident_type_str})")
+            return incident_id
+        except Exception as e:
+            print(f"Error creating incident: {e}")
+            return None
 
 
 # Global instance

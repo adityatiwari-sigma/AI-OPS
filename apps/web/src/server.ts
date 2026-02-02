@@ -9,7 +9,7 @@ app.use('/public/*', serveStatic({ root: './' }))
 // API: Get system metrics from Netdata
 app.get('/api/metrics', async (c) => {
   try {
-    const response = await fetch('http://localhost:19999/api/v1/data?chart=system.cpu&after=-60&points=60&format=json')
+    const response = await fetch('http://localhost:19998/api/v1/data?chart=system.cpu&after=-60&points=60&format=json')
     const data = await response.json()
     return c.json(data)
   } catch (error) {
@@ -20,7 +20,7 @@ app.get('/api/metrics', async (c) => {
 // API: Get ALL charts from Netdata
 app.get('/api/charts', async (c) => {
   try {
-    const response = await fetch('http://localhost:19999/api/v1/charts')
+    const response = await fetch('http://localhost:19998/api/v1/charts')
     const data = await response.json()
     return c.json(data)
   } catch (error) {
@@ -34,7 +34,7 @@ app.get('/api/chart/:chart', async (c) => {
   const after = c.req.query('after') || '-60'
   const points = c.req.query('points') || '60'
   try {
-    const response = await fetch(`http://localhost:19999/api/v1/data?chart=${chart}&after=${after}&points=${points}&format=json`)
+    const response = await fetch(`http://localhost:19998/api/v1/data?chart=${chart}&after=${after}&points=${points}&format=json`)
     const data = await response.json()
     return c.json(data)
   } catch (error) {
@@ -118,7 +118,7 @@ app.post('/api/alerts/:id/reject', async (c) => {
 // API: Get system info
 app.get('/api/info', async (c) => {
   try {
-    const response = await fetch('http://localhost:19999/api/v1/info')
+    const response = await fetch('http://localhost:19998/api/v1/info')
     const data = await response.json()
     return c.json(data)
   } catch (error) {
@@ -126,82 +126,151 @@ app.get('/api/info', async (c) => {
   }
 })
 
-// API: Get Top Processes using ps command
+// API: Get Top Processes/Containers from REMOTE server via Netdata API
 app.get('/api/processes', async (c) => {
   try {
-    const sortBy = c.req.query('sort') || 'cpu';
-    const sortFlag = sortBy === 'memory' ? '-%mem' : '-%cpu';
-    const proc = Bun.spawn(['ps', 'aux', `--sort=${sortFlag}`]);
-    const output = await new Response(proc.stdout).text();
-    const lines = output.trim().split('\n');
+    // Fetch list of charts to find Docker/cgroup CPU charts
+    const chartsResponse = await fetch('http://localhost:19998/api/v1/charts');
+    if (!chartsResponse.ok) {
+      throw new Error('Failed to fetch charts list');
+    }
 
-    // Skip header, take top 10
-    const processes = lines.slice(1, 11).map(line => {
-      const parts = line.trim().split(/\s+/);
-      return {
-        user: parts[0],
-        pid: parts[1],
-        cpu: parseFloat(parts[2]) || 0,
-        memory: parseFloat(parts[3]) || 0,
-        command: parts.slice(10).join(' ').substring(0, 50)
-      };
-    });
+    const chartsData = await chartsResponse.json() as { charts: Record<string, { id: string, name: string, family: string }> };
 
-    return c.json({ processes });
+    // Find cgroup CPU charts (Docker containers)
+    const cgroupCpuCharts = Object.keys(chartsData.charts).filter(c =>
+      c.includes('cgroup_') && c.includes('.cpu') && !c.includes('cpu_limit') && !c.includes('throttled')
+    );
+
+    let processes: Array<{ user: string, pid: string, cpu: number, memory: number, command: string }> = [];
+
+    // If we have cgroup charts, use those (Docker containers)
+    for (const chartId of cgroupCpuCharts.slice(0, 15)) {
+      try {
+        const cpuResp = await fetch(`http://localhost:19998/api/v1/data?chart=${chartId}&after=-5&points=1&format=json`);
+        if (cpuResp.ok) {
+          const cpuData = await cpuResp.json() as { labels: string[], data: number[][] };
+          // Sum all CPU dimensions
+          const cpuTotal = cpuData.data[0]?.slice(1).reduce((a: number, b: number) => a + (b || 0), 0) || 0;
+
+          // Try to get memory for same container
+          const memChartId = chartId.replace('.cpu', '.mem');
+          let memTotal = 0;
+          try {
+            const memResp = await fetch(`http://localhost:19998/api/v1/data?chart=${memChartId}&after=-5&points=1&format=json`);
+            if (memResp.ok) {
+              const memData = await memResp.json() as { labels: string[], data: number[][] };
+              // Get RSS or total memory
+              const rssIdx = memData.labels.indexOf('rss');
+              memTotal = rssIdx > 0 ? (memData.data[0]?.[rssIdx] || 0) / 1048576 : 0; // Convert to MB
+            }
+          } catch { }
+
+          // Extract container name from chart ID
+          const containerName = chartId.replace('cgroup_', '').replace('.cpu', '').replace(/_/g, '-');
+
+          processes.push({
+            user: 'docker',
+            pid: '-',
+            cpu: parseFloat(cpuTotal.toFixed(2)),
+            memory: parseFloat(memTotal.toFixed(2)),
+            command: containerName.substring(0, 50)
+          });
+        }
+      } catch { }
+    }
+
+    // If no cgroup charts, try to get system CPU breakdown
+    if (processes.length === 0) {
+      const sysResp = await fetch('http://localhost:19998/api/v1/data?chart=system.cpu&after=-5&points=1&format=json');
+      if (sysResp.ok) {
+        const sysData = await sysResp.json() as { labels: string[], data: number[][] };
+        sysData.labels.slice(1).forEach((label: string, idx: number) => {
+          const val = sysData.data[0]?.[idx + 1] || 0;
+          if (val > 0.1) {
+            processes.push({
+              user: 'system',
+              pid: '-',
+              cpu: parseFloat(val.toFixed(2)),
+              memory: 0,
+              command: `CPU: ${label}`
+            });
+          }
+        });
+      }
+    }
+
+    // Sort by CPU and take top 10
+    processes.sort((a, b) => b.cpu - a.cpu);
+
+    return c.json({ processes: processes.slice(0, 10) });
   } catch (error) {
-    return c.json({ error: 'Failed to fetch processes', processes: [] }, 500);
+    console.error('Processes API error:', error);
+    return c.json({ error: 'Failed to fetch processes from remote server', processes: [] }, 500);
   }
 })
 
-// API: Get Top Disk Usage Directories
+// API: Get Top Disk Usage from REMOTE server via Netdata API (through SSH tunnel)
 app.get('/api/disk-usage', async (c) => {
   try {
-    // Get total disk space first (use shell to avoid permission issues)
-    const dfProc = Bun.spawn(['sh', '-c', 'df -B1 / | tail -1']);
-    const dfOutput = await new Response(dfProc.stdout).text();
-    await dfProc.exited;
+    // Fetch disk space data from Netdata via SSH tunnel
+    const diskResponse = await fetch('http://localhost:19998/api/v1/data?chart=disk_space._&after=-1&points=1&format=json');
 
-    let totalDiskBytes = 500000000000; // Default 500GB
-    const dfParts = dfOutput.trim().split(/\s+/);
-    if (dfParts.length > 1) {
-      totalDiskBytes = parseInt(dfParts[1]) || 500000000000;
-    }
+    if (!diskResponse.ok) {
+      // Try alternative chart name
+      const altResponse = await fetch('http://localhost:19998/api/v1/charts');
+      const chartsData = await altResponse.json() as { charts: Record<string, { name: string }> };
 
-    // Get top directories (use shell with error suppression)
-    const proc = Bun.spawn(['sh', '-c', 'du -h --max-depth=1 /home /var /usr /opt 2>/dev/null | sort -h -r | head -20']);
-    const output = await new Response(proc.stdout).text();
-    await proc.exited;
+      // Find disk space charts
+      const diskCharts = Object.keys(chartsData.charts).filter(c => c.startsWith('disk_space.'));
 
-    const lines = output.trim().split('\n').filter(l => l.length > 0);
+      let directories: Array<{ idx: number, path: string, size: string, sizeBytes: number, percent: string }> = [];
+      let totalDiskBytes = 500000000000; // Default 500GB
 
-    const directories = lines.map((line, idx) => {
-      const parts = line.trim().split(/\s+/);
-      const size = parts[0] || '0';
-      const path = parts[1] || '/';
+      for (const chartName of diskCharts.slice(0, 10)) {
+        const chartResponse = await fetch(`http://localhost:19998/api/v1/data?chart=${chartName}&after=-1&points=1&format=json`);
+        if (chartResponse.ok) {
+          const chartData = await chartResponse.json() as { labels: string[], data: number[][] };
+          const usedIdx = chartData.labels.indexOf('used');
+          const availIdx = chartData.labels.indexOf('avail');
 
-      // Parse human-readable size to bytes
-      let sizeBytes = 0;
-      const match = size.match(/^([\d.]+)([KMGT]?)$/i);
-      if (match) {
-        const num = parseFloat(match[1]);
-        const unit = (match[2] || '').toUpperCase();
-        const multipliers: Record<string, number> = { '': 1, 'K': 1024, 'M': 1048576, 'G': 1073741824, 'T': 1099511627776 };
-        sizeBytes = num * (multipliers[unit] || 1);
+          if (usedIdx > 0 && chartData.data[0]) {
+            const usedGB = chartData.data[0][usedIdx] || 0;
+            const availGB = chartData.data[0][availIdx] || 0;
+            const totalGB = usedGB + availGB;
+
+            directories.push({
+              idx: directories.length + 1,
+              path: chartName.replace('disk_space.', '/').replace(/_/g, '/'),
+              size: usedGB >= 1024 ? (usedGB / 1024).toFixed(1) + 'T' : usedGB.toFixed(1) + 'G',
+              sizeBytes: usedGB * 1073741824,
+              percent: totalGB > 0 ? ((usedGB / totalGB) * 100).toFixed(1) : '0'
+            });
+          }
+        }
       }
 
-      return { idx: idx + 1, path, size, sizeBytes };
-    });
+      return c.json({ directories, totalDiskBytes });
+    }
 
-    // Take top 10 (already sorted by shell command)
-    const top = directories.slice(0, 10);
+    const diskData = await diskResponse.json() as { labels: string[], data: number[][] };
+    const usedIdx = diskData.labels.indexOf('used');
+    const availIdx = diskData.labels.indexOf('avail');
 
-    // Calculate percentage based on TOTAL disk space
-    const withPercent = top.map(d => ({
-      ...d,
-      percent: ((d.sizeBytes / totalDiskBytes) * 100).toFixed(1)
-    }));
+    const usedGB = diskData.data[0]?.[usedIdx] || 0;
+    const availGB = diskData.data[0]?.[availIdx] || 0;
+    const totalGB = usedGB + availGB;
+    const totalDiskBytes = totalGB * 1073741824;
 
-    return c.json({ directories: withPercent, totalDiskBytes });
+    const directories = [{
+      idx: 1,
+      path: '/',
+      size: usedGB >= 1024 ? (usedGB / 1024).toFixed(1) + 'T' : usedGB.toFixed(1) + 'G',
+      sizeBytes: usedGB * 1073741824,
+      percent: totalGB > 0 ? ((usedGB / totalGB) * 100).toFixed(1) : '0'
+    }];
+
+    return c.json({ directories, totalDiskBytes });
   } catch (error) {
     console.error('Disk usage API error:', error);
     return c.json({ error: String(error), directories: [] }, 500);
@@ -263,6 +332,17 @@ app.get('/api/audit-log', async (c) => {
     return c.json(data)
   } catch (error) {
     return c.json({ logs: [] })
+  }
+})
+
+// API: Get availability metrics from peekaping
+app.get('/api/metrics/availability', async (c) => {
+  try {
+    const response = await fetch('http://localhost:8000/api/metrics/availability')
+    const data = await response.json()
+    return c.json(data)
+  } catch (error) {
+    return c.json({ error: 'Failed to fetch availability metrics' }, 500)
   }
 })
 
@@ -1095,18 +1175,18 @@ const dashboardHTML = `<!DOCTYPE html>
       </div>
       <div style="padding: 16px; border-top: 1px solid var(--border);">
         <div class="sidebar-title" style="margin-bottom: 12px;">Quick Stats</div>
-        <div style="font-family: 'JetBrains Mono', monospace; font-size: 12px; color: var(--text-secondary);">
-          <div style="display: flex; justify-content: space-between; margin-bottom: 8px;">
-            <span>Uptime</span>
-            <span id="uptimeValue" style="color: var(--text-primary);">--</span>
+        <div style="font-family: 'JetBrains Mono', monospace; font-size: 11px; color: var(--text-secondary);">
+          <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; gap: 8px;">
+            <span style="flex-shrink: 0;">Uptime</span>
+            <span id="uptimeValue" style="color: var(--text-primary); text-align: right;">--</span>
           </div>
-          <div style="display: flex; justify-content: space-between; margin-bottom: 8px;">
-            <span>Hostname</span>
-            <span id="hostnameValue" style="color: var(--text-primary);">--</span>
+          <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; gap: 8px;">
+            <span style="flex-shrink: 0;">Hostname</span>
+            <span id="hostnameValue" style="color: var(--text-primary); text-align: right; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 120px;" title="">--</span>
           </div>
-          <div style="display: flex; justify-content: space-between;">
-            <span>Charts</span>
-            <span id="chartsCount" style="color: var(--accent);">--</span>
+          <div style="display: flex; justify-content: space-between; align-items: center; gap: 8px;">
+            <span style="flex-shrink: 0;">IP Address</span>
+            <span id="ipAddressValue" style="color: var(--accent); text-align: right;">--</span>
           </div>
         </div>
       </div>
@@ -1822,10 +1902,12 @@ const dashboardHTML = `<!DOCTYPE html>
         const res = await fetch('/api/chart/system.ram?after=-60&points=60');
         const data = await res.json();
         if (data.data) {
+          // Netdata system.ram labels: [time, free, used, cached, buffers]
+          // Use actual 'used' memory (index 1) / total
           chartData.mem = data.data.map(row => {
-            const values = row.slice(1);
-            const total = values.reduce((a, b) => a + b, 0);
-            const used = values[1] || 0;
+            const values = row.slice(1); // [free, used, cached, buffers]
+            const total = values.reduce((a, b) => a + (b || 0), 0);
+            const used = values[1] || 0; // Actual 'used' memory (not including cache/buffers)
             return total > 0 ? (used / total * 100) : 0;
           }).reverse();
           
@@ -1920,25 +2002,42 @@ const dashboardHTML = `<!DOCTYPE html>
         const data = await res.json();
         
         document.getElementById('netdataStatus').textContent = 'Connected';
-        document.getElementById('hostnameValue').textContent = data.hostname || '--';
         
-        const uptime = data.host?.uptime || 0;
-        const hours = Math.floor(uptime / 3600);
-        const mins = Math.floor((uptime % 3600) / 60);
-        document.getElementById('uptimeValue').textContent = \`\${hours}h \${mins}m\`;
-      }catch (e) {
+        // Get hostname and IP from host_labels
+        const hostLabels = data.host_labels || {};
+        document.getElementById('hostnameValue').textContent = hostLabels._hostname || data.hostname || '--';
+        
+        // Get IP address from Netdata host_labels
+        const ipAddress = hostLabels._net_default_iface_ip || '--';
+        document.getElementById('ipAddressValue').textContent = ipAddress;
+        
+        // Get uptime from peekaping availability API
+        try {
+          const availRes = await fetch('/api/metrics/availability');
+          const availData = await availRes.json();
+          const uptimePercent = availData.metrics?.uptime_percentage?.value;
+          if (uptimePercent !== undefined) {
+            document.getElementById('uptimeValue').textContent = uptimePercent.toFixed(1) + '%';
+          } else {
+            // Fallback to Netdata host uptime
+            const uptime = data.host?.uptime || 0;
+            const hours = Math.floor(uptime / 3600);
+            const mins = Math.floor((uptime % 3600) / 60);
+            document.getElementById('uptimeValue').textContent = \`\${hours}h \${mins}m\`;
+          }
+        } catch {
+          // Fallback to Netdata host uptime
+          const uptime = data.host?.uptime || 0;
+          const hours = Math.floor(uptime / 3600);
+          const mins = Math.floor((uptime % 3600) / 60);
+          document.getElementById('uptimeValue').textContent = \`\${hours}h \${mins}m\`;
+        }
+      } catch (e) {
         document.getElementById('netdataStatus').textContent = 'Disconnected';
       }
     }
 
-    async function fetchCharts() {
-      try {
-        const res = await fetch('/api/charts');
-        const data = await res.json();
-        const count = Object.keys(data.charts || {}).length;
-        document.getElementById('chartsCount').textContent = count;
-      }catch (e) {}
-    }
+
 
     async function fetchProcesses() {
       try {
@@ -2138,7 +2237,6 @@ const dashboardHTML = `<!DOCTYPE html>
       fetchAlerts();
       fetchProcesses();
       fetchInfo();
-      fetchCharts();
     }
 
     function refreshAlerts() {
@@ -3088,6 +3186,7 @@ const dashboardHTML = `<!DOCTYPE html>
 export default {
   port: 3001,
   fetch: app.fetch,
+  idleTimeout: 60, // Increased timeout for SSH-tunneled Netdata requests
 }
 
 console.log('🔷 AIOps Command Center BEAST MODE running at http://localhost:3001')

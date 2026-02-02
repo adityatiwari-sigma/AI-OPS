@@ -1,0 +1,140 @@
+---
+# HTTP 5xx Spike Response Playbook
+# Diagnose and remediate server error spikes
+
+- name: HTTP 5xx Error Spike Response
+  hosts: "{{ target_host | default('localhost') }}"
+  gather_facts: true
+  vars:
+    callback_url: "{{ callback | default('http://localhost:8000/automation/callback') }}"
+    action_id: "{{ action_id | default('unknown') }}"
+    service_name: "{{ service | default('gunicorn') }}"
+    log_path: "{{ logs | default('/var/log/nginx/error.log') }}"
+
+  tasks:
+    - name: Report start
+      uri:
+        url: "{{ callback_url }}"
+        method: POST
+        body_format: json
+        body:
+          action_id: "{{ action_id }}"
+          status: "running"
+          message: "Investigating HTTP 5xx error spike"
+      ignore_errors: true
+
+    # 1. Inspect error logs
+    - name: Tail error logs (last 100 lines)
+      shell: "tail -n 100 {{ log_path }} 2>/dev/null || tail -n 100 /var/log/syslog"
+      register: error_logs
+      ignore_errors: true
+      changed_when: false
+
+    - name: Count error patterns
+      shell: "tail -n 100 {{ log_path }} 2>/dev/null | grep -i '5[0-9][0-9]' | wc -l"
+      register: error_count
+      ignore_errors: true
+      changed_when: false
+
+    - name: Log error count
+      debug:
+        msg: "Found {{ error_count.stdout }} 5xx errors in last 100 log lines"
+
+    # 2. Identify top error patterns
+    - name: Extract unique error patterns
+      shell: "tail -n 100 {{ log_path }} 2>/dev/null | grep -i '5[0-9][0-9]' | awk '{print $NF}' | sort | uniq -c | sort -rn | head -5"
+      register: error_patterns
+      ignore_errors: true
+      changed_when: false
+
+    - name: Top error patterns
+      debug:
+        msg: "{{ error_patterns.stdout_lines }}"
+
+    # 3. Check application service health
+    - name: Check application service status
+      command: "systemctl status {{ service_name }}"
+      register: app_status
+      ignore_errors: true
+      changed_when: false
+
+    - name: Application health
+      debug:
+        msg: "Application status: {{ 'HEALTHY' if app_status.rc == 0 and 'active (running)' in app_status.stdout else 'DEGRADED' }}"
+
+    # 4. Check database connectivity
+    - name: Test database connection (PostgreSQL)
+      command: "psql -U aiops -d peekaping -c 'SELECT 1;'"
+      register: db_check
+      ignore_errors: true
+      changed_when: false
+      environment:
+        PGPASSWORD: "aiops_password"
+
+    - name: Database connectivity
+      debug:
+        msg: "Database {{ 'ACCESSIBLE' if db_check.rc == 0 else 'UNREACHABLE' }}"
+
+    # 5. Check for recent deployments
+    - name: Check for recent file changes (possible deployment)
+      shell: "find /home/*/Documents/AIOPS/AI-OPS -name '*.py' -mmin -30 2>/dev/null | head -10"
+      register: recent_changes
+      ignore_errors: true
+      changed_when: false
+
+    - name: Recent deployments
+      debug:
+        msg: "Files modified in last 30 min: {{ recent_changes.stdout_lines | length }}"
+
+    # 6. Restart application if needed (requires human approval in real scenario)
+    - name: Check if restart is recommended
+      set_fact:
+        should_restart: "{{ app_status.rc != 0 or error_count.stdout|int > 50 }}"
+
+    - name: Restart application service (if approved)
+      service:
+        name: "{{ service_name }}"
+        state: restarted
+      become: true
+      when: should_restart
+      register: app_restart
+      ignore_errors: true
+
+    # 7. Monitor error rate post-action
+    - name: Wait and monitor
+      wait_for:
+        timeout: 10
+      when: app_restart is changed
+
+    - name: Check error rate after restart
+      shell: "tail -n 50 {{ log_path }} 2>/dev/null | grep -i '5[0-9][0-9]' | wc -l"
+      register: post_error_count
+      ignore_errors: true
+      changed_when: false
+      when: app_restart is changed
+
+    # 8. Report findings
+    - name: Compile investigation report
+      set_fact:
+        investigation_report:
+          error_count_before: "{{ error_count.stdout }}"
+          error_count_after: "{{ post_error_count.stdout if app_restart is changed else 'N/A' }}"
+          error_patterns: "{{ error_patterns.stdout_lines[:3] }}"
+          app_status: "{{ 'HEALTHY' if app_status.rc == 0 else 'DEGRADED' }}"
+          db_accessible: "{{ db_check.rc == 0 }}"
+          recent_deployments: "{{ recent_changes.stdout_lines | length }}"
+          service_restarted: "{{ app_restart is changed }}"
+          recommendation: "{{ 'Rollback deployment' if recent_changes.stdout_lines | length > 5 and error_count.stdout|int > 30 else 'Monitor closely' }}"
+
+    - name: Report results
+      uri:
+        url: "{{ callback_url }}"
+        method: POST
+        body_format: json
+        body:
+          action_id: "{{ action_id }}"
+          status: "completed"
+          success: true
+          message: "5xx spike investigation completed"
+          details: "{{ investigation_report }}"
+      ignore_errors: true

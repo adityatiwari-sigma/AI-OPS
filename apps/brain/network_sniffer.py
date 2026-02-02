@@ -144,9 +144,17 @@ class NetworkSniffer:
         dst_external = not self.is_private_ip(dst_ip)
         
         # Check for suspicious/dangerous ports (these ARE suspicious)
+        # Exception: SSH (22) within the same private network is normal
         if port in SUSPICIOUS_PORTS:
-            is_suspicious = True
-            suspicious_reasons.append(f"Dangerous port: {port} ({SUSPICIOUS_PORTS[port]})")
+            # For SSH, only flag if traffic is to/from external IPs
+            if port == 22:
+                if src_external or dst_external:
+                    is_suspicious = True
+                    suspicious_reasons.append(f"External SSH: {port} ({SUSPICIOUS_PORTS[port]})")
+                # Internal SSH is not flagged as suspicious
+            else:
+                is_suspicious = True
+                suspicious_reasons.append(f"Dangerous port: {port} ({SUSPICIOUS_PORTS[port]})")
         
         # Check payload for attack patterns (these ARE suspicious)
         payload_issue = self.check_suspicious_payload(payload)

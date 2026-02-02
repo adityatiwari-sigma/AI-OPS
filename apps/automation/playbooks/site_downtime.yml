@@ -1,0 +1,127 @@
+---
+# Site Downtime Response Playbook
+# Comprehensive checks and automated recovery for complete service unavailability
+
+- name: Site Downtime Response
+  hosts: "{{ target_host | default('localhost') }}"
+  gather_facts: true
+  vars:
+    callback_url: "{{ callback | default('http://localhost:8000/automation/callback') }}"
+    action_id: "{{ action_id | default('unknown') }}"
+    site_url: "{{ url | default('http://localhost') }}"
+    service_name: "{{ service | default('nginx') }}"
+
+  tasks:
+    - name: Report playbook start
+      uri:
+        url: "{{ callback_url }}"
+        method: POST
+        body_format: json
+        body:
+          action_id: "{{ action_id }}"
+          status: "running"
+          message: "Starting site downtime response playbook"
+      ignore_errors: true
+
+    # 1. HTTP Health Check
+    - name: Test HTTP connectivity to site
+      uri:
+        url: "{{ site_url }}"
+        method: GET
+        timeout: 5
+        status_code: [200, 201, 301, 302]
+      register: http_check
+      ignore_errors: true
+
+    - name: Log HTTP check result
+      debug:
+        msg: "HTTP check {{ 'PASSED' if http_check.status is defined and http_check.status in [200, 201, 301, 302] else 'FAILED' }}"
+
+    # 2. DNS Resolution Check
+    - name: Check DNS resolution
+      command: "nslookup google.com"
+      register: dns_check
+      ignore_errors: true
+      changed_when: false
+
+    - name: DNS resolution status
+      debug:
+        msg: "DNS {{ 'working' if dns_check.rc == 0 else 'FAILED' }}"
+
+    # 3. Web Server Service Check
+    - name: Check if web server service exists
+      command: "systemctl status {{ service_name }}"
+      register: service_status
+      ignore_errors: true
+      changed_when: false
+
+    - name: Web server service status
+      debug:
+        msg: "Service {{ service_name }}: {{ service_status.stdout_lines[0] if service_status.rc == 0 else 'NOT RUNNING' }}"
+
+    # 4. Restart web server if down
+    - name: Restart web server service
+      service:
+        name: "{{ service_name }}"
+        state: restarted
+      become: true
+      when: service_status.rc != 0 or 'inactive' in service_status.stdout
+      register: service_restart
+      ignore_errors: true
+
+    - name: Wait for service to stabilize
+      wait_for:
+        timeout: 5
+      when: service_restart is changed
+
+    # 5. Verify web server is active
+    - name: Verify service is running
+      command: "systemctl is-active {{ service_name }}"
+      register: service_active
+      changed_when: false
+      ignore_errors: true
+
+    # 6. Check application runtime (Python/Node/etc)
+    - name: Check for application process
+      shell: "ps aux | grep -i python | grep -v grep || ps aux | grep -i node | grep -v grep"
+      register: app_process_check
+      ignore_errors: true
+      changed_when: false
+
+    - name: Application process status
+      debug:
+        msg: "Application processes found: {{ app_process_check.stdout_lines | length }}"
+
+    # 7. Post-restart validation
+    - name: Re-test HTTP after remediation
+      uri:
+        url: "{{ site_url }}"
+        method: GET
+        timeout: 5
+        status_code: [200, 201, 301, 302]
+      register: http_recheck
+      ignore_errors: true
+      when: service_restart is changed
+
+    # 8. Compile and report results
+    - name: Build status report
+      set_fact:
+        site_status:
+          http_accessible: "{{ http_recheck.status is defined and http_recheck.status in [200, 201, 301, 302] if service_restart is changed else (http_check.status is defined and http_check.status in [200, 201, 301, 302]) }}"
+          dns_working: "{{ dns_check.rc == 0 }}"
+          service_running: "{{ service_active.stdout == 'active' if service_active is defined else false }}"
+          service_restarted: "{{ service_restart is changed }}"
+          app_processes: "{{ app_process_check.stdout_lines | length }}"
+
+    - name: Report success
+      uri:
+        url: "{{ callback_url }}"
+        method: POST
+        body_format: json
+        body:
+          action_id: "{{ action_id }}"
+          status: "completed"
+          success: "{{ site_status.http_accessible }}"
+          message: "Site downtime response completed"
+          details: "{{ site_status }}"
+      ignore_errors: true

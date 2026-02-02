@@ -36,7 +36,7 @@ app.add_middleware(
 )
 
 # Configuration
-NETDATA_URL = os.getenv("NETDATA_URL", "http://localhost:19999")
+NETDATA_URL = os.getenv("NETDATA_URL", "http://localhost:19998")
 CEREBRAS_API_KEY = 'csk-vtykhvxvxhtnrtdrd3p892v48nfpd2mt49tpx4mr68d69559'
 DATABASE_URL = os.getenv("DATABASE_URL", "postgres://aiops:aiops_password@localhost:5432/peekaping")
 

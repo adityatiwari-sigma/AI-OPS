@@ -1,0 +1,165 @@
+---
+# Database Latency Response Playbook
+# Diagnose and remediate database performance issues
+
+- name: Database Latency Investigation
+  hosts: "{{ target_host | default('localhost') }}"
+  gather_facts: true
+  vars:
+    callback_url: "{{ callback | default('http://localhost:8000/automation/callback') }}"
+    action_id: "{{ action_id | default('unknown') }}"
+    db_host: "{{ database_host | default('localhost') }}"
+    db_name: "{{ database | default('peekaping') }}"
+    db_user: "{{ db_username | default('aiops') }}"
+
+  tasks:
+    - name: Report start
+      uri:
+        url: "{{ callback_url }}"
+        method: POST
+        body_format: json
+        body:
+          action_id: "{{ action_id }}"
+          status: "running"
+          message: "Investigating database latency"
+      ignore_errors: true
+
+    # 1. Test query latency
+    - name: Measure test query latency
+      shell: |
+        time psql -h {{ db_host }} -U {{ db_user }} -d {{ db_name }} -c 'SELECT 1;' 2>&1 | grep real
+      register: query_latency
+      ignore_errors: true
+      changed_when: false
+      environment:
+        PGPASSWORD: "aiops_password"
+
+    - name: Query latency result
+      debug:
+        msg: "Query latency: {{ query_latency.stdout }}"
+
+    # 2. Check active connections
+    - name: Count active database connections
+      shell: |
+        psql -h {{ db_host }} -U {{ db_user }} -d {{ db_name }} -t -c "SELECT count(*) FROM pg_stat_activity WHERE state != 'idle';"
+      register: active_connections
+      ignore_errors: true
+      changed_when: false
+      environment:
+        PGPASSWORD: "aiops_password"
+
+    - name: Active connections count
+      debug:
+        msg: "Active connections: {{ active_connections.stdout | trim }}"
+
+    # 3. Identify long-running queries
+    - name: List long-running queries (>5 seconds)
+      shell: |
+        psql -h {{ db_host }} -U {{ db_user }} -d {{ db_name }} -c "
+        SELECT pid, now() - query_start AS duration, query 
+        FROM pg_stat_activity 
+        WHERE state != 'idle' AND now() - query_start > interval '5 seconds'
+        ORDER BY duration DESC LIMIT 5;"
+      register: long_queries
+      ignore_errors: true
+      changed_when: false
+      environment:
+        PGPASSWORD: "aiops_password"
+
+    - name: Long-running queries found
+      debug:
+        msg: "{{ long_queries.stdout_lines }}"
+
+    # 4. Check connection pool utilization
+    - name: Get max connections setting
+      shell: |
+        psql -h {{ db_host }} -U {{ db_user }} -d {{ db_name }} -t -c "SHOW max_connections;"
+      register: max_connections
+      ignore_errors: true
+      changed_when: false
+      environment:
+        PGPASSWORD: "aiops_password"
+
+    - name: Calculate pool utilization
+      set_fact:
+        pool_utilization: "{{ ((active_connections.stdout | trim | int) / (max_connections.stdout | trim | int) * 100) | round(1) if max_connections.stdout is defined else 0 }}"
+
+    - name: Pool utilization percentage
+      debug:
+        msg: "Connection pool {{ pool_utilization }}% utilized"
+
+    # 5. Check for blocking queries
+    - name: Identify blocking queries
+      shell: |
+        psql -h {{ db_host }} -U {{ db_user }} -d {{ db_name }} -c "
+        SELECT blocked_locks.pid AS blocked_pid,
+               blocking_locks.pid AS blocking_pid,
+               blocked_activity.query AS blocked_query
+        FROM pg_catalog.pg_locks blocked_locks
+        JOIN pg_catalog.pg_stat_activity blocked_activity ON blocked_activity.pid = blocked_locks.pid
+        JOIN pg_catalog.pg_locks blocking_locks ON blocking_locks.locktype = blocked_locks.locktype
+        WHERE NOT blocked_locks.granted AND blocking_locks.granted
+        LIMIT 5;"
+      register: blocking_queries
+      ignore_errors: true
+      changed_when: false
+      environment:
+        PGPASSWORD: "aiops_password"
+
+    # 6. Check for missing indexes
+    - name: Find tables with sequential scans
+      shell: |
+        psql -h {{ db_host }} -U {{ db_user }} -d {{ db_name }} -c "
+        SELECT schemaname, tablename, seq_scan, seq_tup_read
+        FROM pg_stat_user_tables
+        WHERE seq_scan > 1000
+        ORDER BY seq_tup_read DESC LIMIT 5;"
+      register: seq_scans
+      ignore_errors: true
+      changed_when: false
+      environment:
+        PGPASSWORD: "aiops_password"
+
+    - name: Tables needing indexes
+      debug:
+        msg: "{{ seq_scans.stdout_lines }}"
+
+    # 7. Check database size and bloat
+    - name: Get database size
+      shell: |
+        psql -h {{ db_host }} -U {{ db_user }} -d {{ db_name }} -t -c "
+        SELECT pg_size_pretty(pg_database_size('{{ db_name }}'));"
+      register: db_size
+      ignore_errors: true
+      changed_when: false
+      environment:
+        PGPASSWORD: "aiops_password"
+
+    # 8. Compile diagnostic report
+    - name: Build database diagnostics
+      set_fact:
+        db_diagnostics:
+          query_latency: "{{ query_latency.stdout }}"
+          active_connections: "{{ active_connections.stdout | trim }}"
+          pool_utilization_pct: "{{ pool_utilization }}"
+          long_running_queries: "{{ long_queries.stdout_lines | length }}"
+          blocking_queries_found: "{{ blocking_queries.stdout_lines | length > 2 }}"
+          tables_needing_indexes: "{{ seq_scans.stdout_lines[:3] }}"
+          database_size: "{{ db_size.stdout | trim }}"
+          recommendations: 
+            - "{{ 'Terminate stuck queries' if long_queries.stdout_lines | length > 5 else 'No immediate action' }}"
+            - "{{ 'Add indexes to high-scan tables' if seq_scans.stdout_lines | length > 3 else 'Index coverage adequate' }}"
+            - "{{ 'Increase connection pool' if pool_utilization | float > 80 else 'Pool size adequate' }}"
+
+    - name: Report database diagnostics
+      uri:
+        url: "{{ callback_url }}"
+        method: POST
+        body_format: json
+        body:
+          action_id: "{{ action_id }}"
+          status: "completed"
+          success: true
+          message: "Database latency investigation completed"
+          details: "{{ db_diagnostics }}"
+      ignore_errors: true

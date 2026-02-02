@@ -29,8 +29,8 @@ class PipelineSimulator:
                 "deploy": "success"
             },
             "metrics": {
-                "latency_ms": random.uniform(100, 300),
-                "error_rate": random.uniform(0, 0.5)
+                "latency_ms": round(random.uniform(100, 300), 3),
+                "error_rate": round(random.uniform(0, 0.5), 3)
             }
         }
 
@@ -39,9 +39,9 @@ class PipelineSimulator:
             state["stages"]["test"] = "skipped"
             state["stages"]["deploy"] = "skipped"
         elif mode == "latency_high":
-            state["metrics"]["latency_ms"] = random.uniform(2500, 4000)
+            state["metrics"]["latency_ms"] = round(random.uniform(2500, 4000), 3)
         elif mode == "error_spike":
-            state["metrics"]["error_rate"] = random.uniform(15, 30)
+            state["metrics"]["error_rate"] = round(random.uniform(15, 30), 3)
 
         with open(self.state_file, 'w') as f:
             json.dump(state, f)
