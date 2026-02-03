@@ -1,15 +1,14 @@
 ---
-# Application Error Spike Response Playbook
-# Investigate and remediate application errors
+# App Error Spike Response Playbook
+# Collect and analyze application errors from DDEV
 
-- name: Application Error Spike Response
-  hosts: "{{ target_host | default('localhost') }}"
-  gather_facts: true
+- name: App Error Spike Response - DDEV
+  hosts: ddev_hosts
+  gather_facts: false
   vars:
     callback_url: "{{ callback | default('http://localhost:8000/automation/callback') }}"
     action_id: "{{ action_id | default('unknown') }}"
-    service_name: "{{ service | default('gunicorn') }}"
-    app_log_path: "{{ logs | default('/var/log/app/errors.log') }}"
+    ddev_dir: "{{ ddev_project_dir | default('~/d1/regenics') }}"
 
   tasks:
     - name: Report start
@@ -21,126 +20,53 @@
           action_id: "{{ action_id }}"
           status: "running"
           message: "Investigating application error spike"
+      delegate_to: localhost
       ignore_errors: true
 
-    # 1. Tail application error logs
-    - name: Get recent application errors
-      shell: "tail -n 200 {{ app_log_path }} 2>/dev/null || journalctl -u {{ service_name }} -n 200 --no-pager"
-      register: app_errors
+    - name: Get web container logs
+      shell: "cd {{ ddev_dir }} && ddev logs -s web 2>&1 | tail -100"
+      register: web_logs
       ignore_errors: true
       changed_when: false
 
-    - name: Error log sample
-      debug:
-        msg: "Retrieved {{ app_errors.stdout_lines | length }} log lines"
-
-    # 2. Count error signatures
-    - name: Count error types
-      shell: "tail -n 200 {{ app_log_path }} 2>/dev/null | grep -i 'error\\|exception\\|traceback' | wc -l"
+    - name: Count error occurrences
+      shell: "cd {{ ddev_dir }} && ddev logs -s web 2>&1 | grep -i 'error\\|fatal\\|exception\\|warning' | wc -l"
       register: error_count
       ignore_errors: true
       changed_when: false
 
-    - name: Total errors detected
-      debug:
-        msg: "{{ error_count.stdout }} errors found in recent logs"
-
-    # 3. Identify top error types
-    - name: Extract error signatures
-      shell: |
-        tail -n 200 {{ app_log_path }} 2>/dev/null | \
-        grep -i 'error\\|exception' | \
-        awk -F: '{print $NF}' | \
-        sort | uniq -c | sort -rn | head -5
-      register: error_signatures
+    - name: Get unique error patterns
+      shell: "cd {{ ddev_dir }} && ddev logs -s web 2>&1 | grep -i 'error\\|fatal' | awk '{print $NF}' | sort | uniq -c | sort -rn | head -5"
+      register: error_patterns
       ignore_errors: true
       changed_when: false
 
-    - name: Top error types
-      debug:
-        msg: "{{ error_signatures.stdout_lines }}"
-
-    # 4. Check for recent deployments
-    - name: Check application file modification times
-      shell: "find /home/*/Documents/AIOPS -name '*.py' -mmin -60 2>/dev/null | wc -l"
-      register: recent_deployment
+    - name: Check WordPress debug log
+      shell: "cd {{ ddev_dir }} && ddev exec cat wp-content/debug.log 2>/dev/null | tail -30 || echo 'No debug.log'"
+      register: wp_debug_log
       ignore_errors: true
       changed_when: false
 
-    - name: Recent deployment detected
-      debug:
-        msg: "{{ recent_deployment.stdout }} files modified in last 60 minutes"
+    - name: Restart DDEV if high error count
+      shell: "cd {{ ddev_dir }} && ddev restart"
+      register: ddev_restart
+      when: error_count.stdout | int > 50
 
-    # 5. Check application service status
-    - name: Get application service status
-      command: "systemctl status {{ service_name }}"
-      register: service_status
-      ignore_errors: true
-      changed_when: false
+    - name: Wait for restart
+      pause:
+        seconds: 15
+      when: ddev_restart is changed
 
-    - name: Service health
-      debug:
-        msg: "Service {{ 'HEALTHY' if service_status.rc == 0 else 'DEGRADED' }}"
-
-    # 6. Check for stack trace patterns
-   - name: Extract full stack traces
-      shell: |
-        tail -n 200 {{ app_log_path }} 2>/dev/null | \
-        grep -A 10 'Traceback' | head -30
-      register: stack_traces
-      ignore_errors: true
-      changed_when: false
-
-    - name: Stack trace sample
-      debug:
-        msg: "{{ stack_traces.stdout_lines[:10] }}"
-
-    # 7. Restart application service
-    - name: Determine if restart is needed
+    - name: Compile error report
       set_fact:
-        restart_recommended: "{{ error_count.stdout|int > 50 or service_status.rc != 0 }}"
+        error_report:
+          total_errors: "{{ error_count.stdout | default('0') }}"
+          top_patterns: "{{ error_patterns.stdout_lines | default([]) }}"
+          recent_logs: "{{ web_logs.stdout_lines[-20:] | default([]) }}"
+          wp_debug: "{{ wp_debug_log.stdout_lines[-10:] | default([]) }}"
+          service_restarted: "{{ ddev_restart is changed }}"
 
-    - name: Restart application service
-      service:
-        name: "{{ service_name }}"
-        state: restarted
-      become: true
-      when: restart_recommended
-      register: app_restart
-      ignore_errors: true
-
-    - name: Wait after restart
-      wait_for:
-        timeout: 15
-      when: app_restart is changed
-
-    # 8. Monitor error rate after restart
-    - name: Check error rate post-restart
-      shell: "tail -n 50 {{ app_log_path }} 2>/dev/null | grep -i 'error\\|exception' | wc -l"
-      register: post_restart_errors
-      ignore_errors: true
-      changed_when: false
-      when: app_restart is changed
-
-    - name: Error rate after restart
-      debug:
-        msg: "Errors after restart: {{ post_restart_errors.stdout }}"
-      when: app_restart is changed
-
-    # 9. Compile error analysis
-    - name: Build error analysis report
-      set_fact:
-        error_analysis:
-          total_errors: "{{ error_count.stdout }}"
-          top_error_types: "{{ error_signatures.stdout_lines[:3] }}"
-          recent_deployment: "{{ recent_deployment.stdout|int > 0 }}"
-          service_restarted: "{{ app_restart is changed }}"
-          errors_before_restart: "{{ error_count.stdout if app_restart is changed else 'N/A' }}"
-          errors_after_restart: "{{ post_restart_errors.stdout if app_restart is changed else 'N/A' }}"
-          stack_trace_sample: "{{ stack_traces.stdout_lines[:5] }}"
-          recommendation: "{{ 'Consider rollback - errors correlate with recent deployment' if recent_deployment.stdout|int > 5 and error_count.stdout|int > 50 else 'Monitor application closely' }}"
-
-    - name: Report error analysis
+    - name: Report results
       uri:
         url: "{{ callback_url }}"
         method: POST
@@ -149,6 +75,7 @@
           action_id: "{{ action_id }}"
           status: "completed"
           success: true
-          message: "Application error spike analysis completed"
-          details: "{{ error_analysis }}"
+          message: "App error investigation completed - {{ error_count.stdout | default('0') }} errors found"
+          details: "{{ error_report }}"
+      delegate_to: localhost
       ignore_errors: true

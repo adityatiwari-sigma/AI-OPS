@@ -511,6 +511,90 @@ async def run_metrics_collection():
 
 
 # ============================================================================
+# DDEV AUTO-RESTART MONITOR
+# ============================================================================
+
+# Track consecutive failures to avoid restart loops
+ddev_failure_count = 0
+DDEV_FAILURE_THRESHOLD = 2  # Restart after 2 consecutive failures
+DDEV_CHECK_INTERVAL = 30  # Check every 30 seconds
+
+async def run_ddev_health_monitor():
+    """Background task to monitor DDEV site and auto-restart when down"""
+    global ddev_failure_count
+    import subprocess
+    
+    await asyncio.sleep(15)  # Wait for services to be ready
+    
+    SSH_HOST = "test@10.10.2.21"
+    SSH_OPTIONS = ["-i", "/home/adityatiwari/.ssh/id_ed25519", "-o", "StrictHostKeyChecking=no", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10"]
+    DDEV_DIR = "~/d1/regenics"
+    
+    while True:
+        try:
+            # Check DDEV site health via SSH
+            check_cmd = ["ssh"] + SSH_OPTIONS + [SSH_HOST, f"cd {DDEV_DIR} && ddev describe -j 2>/dev/null | grep -q 'running' && echo 'OK' || echo 'DOWN'"]
+            
+            process = subprocess.run(
+                check_cmd,
+                capture_output=True,
+                text=True,
+                timeout=20
+            )
+            
+            is_healthy = "OK" in process.stdout
+            
+            if is_healthy:
+                if ddev_failure_count > 0:
+                    print(f"✅ DDEV recovered - site is healthy")
+                    await log_audit("DDEV_RECOVERED", "system", "DDEV site is back online", {}, None)
+                else:
+                    # Log periodic status (every ~2.5 minutes = 5 checks)
+                    import random
+                    if random.randint(1, 5) == 1:
+                        print(f"💚 DDEV health check OK - site running")
+                ddev_failure_count = 0
+            else:
+                ddev_failure_count += 1
+                print(f"⚠️ DDEV check failed ({ddev_failure_count}/{DDEV_FAILURE_THRESHOLD}): {process.stdout.strip() or process.stderr.strip()}")
+                
+                if ddev_failure_count >= DDEV_FAILURE_THRESHOLD:
+                    print(f"🔄 AUTO-RESTARTING DDEV - {ddev_failure_count} consecutive failures")
+                    await log_audit("DDEV_AUTO_RESTART", "system", f"Auto-restarting DDEV after {ddev_failure_count} failures", {}, None)
+                    
+                    # Execute DDEV restart via SSH
+                    restart_cmd = ["ssh"] + SSH_OPTIONS + [SSH_HOST, f"cd {DDEV_DIR} && ddev restart"]
+                    restart_process = subprocess.run(
+                        restart_cmd,
+                        capture_output=True,
+                        text=True,
+                        timeout=120
+                    )
+                    
+                    if restart_process.returncode == 0:
+                        print(f"✅ DDEV restart completed successfully")
+                        await log_audit("DDEV_RESTART_SUCCESS", "system", "DDEV restarted successfully", {"output": restart_process.stdout[-500:]}, None)
+                        ddev_failure_count = 0
+                    else:
+                        print(f"❌ DDEV restart failed: {restart_process.stderr}")
+                        await log_audit("DDEV_RESTART_FAILED", "system", "DDEV restart failed", {"error": restart_process.stderr}, None)
+                    
+                    # Wait longer after a restart attempt
+                    await asyncio.sleep(60)
+                    continue
+            
+            await asyncio.sleep(DDEV_CHECK_INTERVAL)
+            
+        except subprocess.TimeoutExpired:
+            print(f"⚠️ DDEV health check timed out")
+            ddev_failure_count += 1
+            await asyncio.sleep(DDEV_CHECK_INTERVAL)
+        except Exception as e:
+            print(f"DDEV health monitor error: {e}")
+            await asyncio.sleep(DDEV_CHECK_INTERVAL)
+
+
+# ============================================================================
 # API ENDPOINTS
 # ============================================================================
 
@@ -521,6 +605,8 @@ async def startup():
     await metrics_collector.initialize()
     # Start background metrics collection
     asyncio.create_task(run_metrics_collection())
+    # Start DDEV health monitor with auto-restart
+    asyncio.create_task(run_ddev_health_monitor())
 
 
 @app.get("/")
@@ -777,14 +863,39 @@ ANSIBLE_EDA_URL = os.getenv("ANSIBLE_EDA_URL", "http://localhost:5000")
 
 
 async def trigger_automation(action_id: str, action: dict) -> dict:
-    """Execute remediation action via SSH to DDEV server"""
+    """Trigger automation via Ansible EDA webhook, fallback to SSH"""
     action_type = action.get("action_type", "custom")
     target = action.get("target", "unknown")
+    description = action.get("description", "")
+    severity = action.get("severity", "MEDIUM")
     
-    await log_audit("SSH_TRIGGERED", "system", f"Executing remediation: {action_type} on {target}", 
-                    {"action_type": action_type, "target": target}, action_id)
+    payload = {
+        "action_id": str(action_id),
+        "action_type": action_type,
+        "target": target,
+        "description": description,
+        "severity": severity,
+        "callback_url": "http://localhost:8000/automation/callback"
+    }
     
-    # Directly execute via SSH (skip EDA)
+    print(f"🔄 EXECUTING REMEDIATION: action_type={action_type}, target={target}")
+    
+    # First try Ansible EDA
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            response = await client.post(ANSIBLE_EDA_URL, json=payload)
+            if response.status_code in [200, 201, 202]:
+                await log_audit("EDA_TRIGGERED", "system", f"Sent to Ansible EDA: {action_type}", payload, action_id)
+                return {
+                    "triggered": True,
+                    "execution_mode": "ansible_eda",
+                    "eda_response": response.status_code,
+                    "message": f"Playbook triggered via Ansible EDA for {action_type}"
+                }
+    except Exception as e:
+        await log_audit("EDA_UNAVAILABLE", "system", f"EDA not available: {str(e)}, falling back to SSH", {}, action_id)
+    
+    # Fallback to direct SSH execution
     return await execute_local_playbook(action_id, action)
 
 

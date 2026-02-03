@@ -1,14 +1,15 @@
 ---
 # Restart Service Playbook
-# Safe restart with pre/post health checks
+# Restart DDEV services on remote server
 
-- name: Restart Service
-  hosts: "{{ target_host | default('localhost') }}"
-  gather_facts: true
+- name: Restart Service - DDEV
+  hosts: ddev_hosts
+  gather_facts: false
   vars:
-    service_name: "{{ service | default('nginx') }}"
     callback_url: "{{ callback | default('http://localhost:8000/automation/callback') }}"
     action_id: "{{ action_id | default('unknown') }}"
+    ddev_dir: "{{ ddev_project_dir | default('~/d1/regenics') }}"
+    service_name: "{{ service | default('all') }}"
 
   tasks:
     - name: Report start
@@ -19,40 +20,28 @@
         body:
           action_id: "{{ action_id }}"
           status: "running"
-          message: "Starting service restart for {{ service_name }}"
+          message: "Restarting DDEV service: {{ service_name }}"
+      delegate_to: localhost
       ignore_errors: true
 
-    - name: Check if service exists
-      command: "systemctl status {{ service_name }}"
-      register: service_status
-      ignore_errors: true
-      changed_when: false
-
-    - name: Service does not exist
-      fail:
-        msg: "Service {{ service_name }} not found on this host"
-      when: service_status.rc == 4
-
-    - name: Get service PID before restart
-      command: "pgrep -f {{ service_name }}"
-      register: pid_before
+    - name: Get status before restart
+      shell: "cd {{ ddev_dir }} && ddev status"
+      register: status_before
       ignore_errors: true
       changed_when: false
 
-    - name: Restart the service
-      service:
-        name: "{{ service_name }}"
-        state: restarted
-      become: true
+    - name: Restart specific DDEV service
+      shell: "cd {{ ddev_dir }} && ddev restart {{ service_name if service_name != 'all' else '' }}"
       register: restart_result
 
-    - name: Wait for service to stabilize
-      wait_for:
-        timeout: 5
+    - name: Wait for service stabilization
+      pause:
+        seconds: 15
 
-    - name: Verify service is running
-      command: "systemctl is-active {{ service_name }}"
-      register: service_active
+    - name: Get status after restart
+      shell: "cd {{ ddev_dir }} && ddev status"
+      register: status_after
+      ignore_errors: true
       changed_when: false
 
     - name: Report success
@@ -63,12 +52,14 @@
         body:
           action_id: "{{ action_id }}"
           status: "completed"
-          success: true
-          message: "Service {{ service_name }} restarted successfully"
+          success: "{{ restart_result.rc == 0 }}"
+          message: "DDEV service {{ service_name }} restarted successfully"
           details:
             service: "{{ service_name }}"
-            status: "{{ service_active.stdout }}"
-      when: service_active.stdout == "active"
+            status_before: "{{ status_before.stdout_lines[:3] | default([]) }}"
+            status_after: "{{ status_after.stdout_lines[:3] | default([]) }}"
+      delegate_to: localhost
+      when: restart_result.rc == 0
 
     - name: Report failure
       uri:
@@ -79,9 +70,9 @@
           action_id: "{{ action_id }}"
           status: "failed"
           success: false
-          message: "Service {{ service_name }} failed to restart"
+          message: "DDEV service restart failed"
           details:
-            service: "{{ service_name }}"
-            status: "{{ service_active.stdout | default('unknown') }}"
-      when: service_active.stdout != "active"
+            error: "{{ restart_result.stderr | default('Unknown error') }}"
+      delegate_to: localhost
+      when: restart_result.rc != 0
       ignore_errors: true

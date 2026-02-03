@@ -1,15 +1,14 @@
 ---
 # HTTP 5xx Spike Response Playbook
-# Diagnose and remediate server error spikes
+# Collect DDEV logs and restart if needed
 
-- name: HTTP 5xx Error Spike Response
-  hosts: "{{ target_host | default('localhost') }}"
-  gather_facts: true
+- name: HTTP 5xx Error Spike Response - DDEV
+  hosts: ddev_hosts
+  gather_facts: false
   vars:
     callback_url: "{{ callback | default('http://localhost:8000/automation/callback') }}"
     action_id: "{{ action_id | default('unknown') }}"
-    service_name: "{{ service | default('gunicorn') }}"
-    log_path: "{{ logs | default('/var/log/nginx/error.log') }}"
+    ddev_dir: "{{ ddev_project_dir | default('~/d1/regenics') }}"
 
   tasks:
     - name: Report start
@@ -21,110 +20,58 @@
           action_id: "{{ action_id }}"
           status: "running"
           message: "Investigating HTTP 5xx error spike"
+      delegate_to: localhost
       ignore_errors: true
 
-    # 1. Inspect error logs
-    - name: Tail error logs (last 100 lines)
-      shell: "tail -n 100 {{ log_path }} 2>/dev/null || tail -n 100 /var/log/syslog"
-      register: error_logs
+    - name: Get DDEV web logs
+      shell: "cd {{ ddev_dir }} && ddev logs -s web 2>&1 | tail -50"
+      register: web_logs
       ignore_errors: true
       changed_when: false
 
-    - name: Count error patterns
-      shell: "tail -n 100 {{ log_path }} 2>/dev/null | grep -i '5[0-9][0-9]' | wc -l"
+    - name: Count PHP errors
+      shell: "cd {{ ddev_dir }} && ddev logs -s web 2>&1 | grep -i 'error\\|fatal\\|exception\\|5[0-9][0-9]' | wc -l"
       register: error_count
       ignore_errors: true
       changed_when: false
 
-    - name: Log error count
-      debug:
-        msg: "Found {{ error_count.stdout }} 5xx errors in last 100 log lines"
-
-    # 2. Identify top error patterns
-    - name: Extract unique error patterns
-      shell: "tail -n 100 {{ log_path }} 2>/dev/null | grep -i '5[0-9][0-9]' | awk '{print $NF}' | sort | uniq -c | sort -rn | head -5"
-      register: error_patterns
+    - name: Get recent PHP errors
+      shell: "cd {{ ddev_dir }} && ddev logs -s web 2>&1 | grep -i 'error\\|fatal\\|exception' | tail -10"
+      register: php_errors
       ignore_errors: true
       changed_when: false
 
-    - name: Top error patterns
-      debug:
-        msg: "{{ error_patterns.stdout_lines }}"
-
-    # 3. Check application service health
-    - name: Check application service status
-      command: "systemctl status {{ service_name }}"
-      register: app_status
+    - name: Check DDEV status
+      shell: "cd {{ ddev_dir }} && ddev status"
+      register: ddev_status
       ignore_errors: true
       changed_when: false
 
-    - name: Application health
-      debug:
-        msg: "Application status: {{ 'HEALTHY' if app_status.rc == 0 and 'active (running)' in app_status.stdout else 'DEGRADED' }}"
+    - name: Restart DDEV if many errors
+      shell: "cd {{ ddev_dir }} && ddev restart"
+      register: ddev_restart
+      when: error_count.stdout | int > 20
 
-    # 4. Check database connectivity
-    - name: Test database connection (PostgreSQL)
-      command: "psql -U aiops -d peekaping -c 'SELECT 1;'"
-      register: db_check
-      ignore_errors: true
-      changed_when: false
-      environment:
-        PGPASSWORD: "aiops_password"
-
-    - name: Database connectivity
-      debug:
-        msg: "Database {{ 'ACCESSIBLE' if db_check.rc == 0 else 'UNREACHABLE' }}"
-
-    # 5. Check for recent deployments
-    - name: Check for recent file changes (possible deployment)
-      shell: "find /home/*/Documents/AIOPS/AI-OPS -name '*.py' -mmin -30 2>/dev/null | head -10"
-      register: recent_changes
-      ignore_errors: true
-      changed_when: false
-
-    - name: Recent deployments
-      debug:
-        msg: "Files modified in last 30 min: {{ recent_changes.stdout_lines | length }}"
-
-    # 6. Restart application if needed (requires human approval in real scenario)
-    - name: Check if restart is recommended
-      set_fact:
-        should_restart: "{{ app_status.rc != 0 or error_count.stdout|int > 50 }}"
-
-    - name: Restart application service (if approved)
-      service:
-        name: "{{ service_name }}"
-        state: restarted
-      become: true
-      when: should_restart
-      register: app_restart
-      ignore_errors: true
-
-    # 7. Monitor error rate post-action
-    - name: Wait and monitor
-      wait_for:
-        timeout: 10
-      when: app_restart is changed
+    - name: Wait for restart
+      pause:
+        seconds: 15
+      when: ddev_restart is changed
 
     - name: Check error rate after restart
-      shell: "tail -n 50 {{ log_path }} 2>/dev/null | grep -i '5[0-9][0-9]' | wc -l"
+      shell: "cd {{ ddev_dir }} && ddev logs -s web 2>&1 | tail -20 | grep -i 'error\\|fatal' | wc -l"
       register: post_error_count
       ignore_errors: true
       changed_when: false
-      when: app_restart is changed
+      when: ddev_restart is changed
 
-    # 8. Report findings
     - name: Compile investigation report
       set_fact:
         investigation_report:
-          error_count_before: "{{ error_count.stdout }}"
-          error_count_after: "{{ post_error_count.stdout if app_restart is changed else 'N/A' }}"
-          error_patterns: "{{ error_patterns.stdout_lines[:3] }}"
-          app_status: "{{ 'HEALTHY' if app_status.rc == 0 else 'DEGRADED' }}"
-          db_accessible: "{{ db_check.rc == 0 }}"
-          recent_deployments: "{{ recent_changes.stdout_lines | length }}"
-          service_restarted: "{{ app_restart is changed }}"
-          recommendation: "{{ 'Rollback deployment' if recent_changes.stdout_lines | length > 5 and error_count.stdout|int > 30 else 'Monitor closely' }}"
+          error_count_before: "{{ error_count.stdout | default('0') }}"
+          error_count_after: "{{ post_error_count.stdout | default('N/A') }}"
+          recent_errors: "{{ php_errors.stdout_lines[:5] | default([]) }}"
+          ddev_status: "{{ 'OK' if 'OK' in ddev_status.stdout | default('') else 'DEGRADED' }}"
+          service_restarted: "{{ ddev_restart is changed }}"
 
     - name: Report results
       uri:
@@ -135,6 +82,7 @@
           action_id: "{{ action_id }}"
           status: "completed"
           success: true
-          message: "5xx spike investigation completed"
+          message: "5xx spike investigation completed - {{ error_count.stdout | default('0') }} errors found"
           details: "{{ investigation_report }}"
+      delegate_to: localhost
       ignore_errors: true

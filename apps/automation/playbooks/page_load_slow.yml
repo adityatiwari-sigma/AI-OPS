@@ -1,14 +1,14 @@
 ---
-# Page Load Slowness Response Playbook
-# Diagnose and optimize frontend performance
+# Page Load Slow Response Playbook
+# Diagnose and fix slow page loads on DDEV
 
-- name: Page Load Performance Optimization
-  hosts: "{{ target_host | default('localhost') }}"
-  gather_facts: true
+- name: Page Load Slow Response - DDEV
+  hosts: ddev_hosts
+  gather_facts: false
   vars:
     callback_url: "{{ callback | default('http://localhost:8000/automation/callback') }}"
     action_id: "{{ action_id | default('unknown') }}"
-    site_url: "{{ url | default('http://localhost') }}"
+    ddev_dir: "{{ ddev_project_dir | default('~/d1/regenics') }}"
 
   tasks:
     - name: Report start
@@ -19,148 +19,58 @@
         body:
           action_id: "{{ action_id }}"
           status: "running"
-          message: "Investigating page load slowness"
+          message: "Investigating slow page loads"
+      delegate_to: localhost
       ignore_errors: true
 
-    # 1. Measure baseline page load time
-    - name: Measure current page load time
-      shell: "curl -o /dev/null -s -w 'Total: %{time_total}s\\nDNS: %{time_namelookup}s\\nConnect: %{time_connect}s\\nTTFB: %{time_starttransfer}s\\n' {{ site_url }}"
-      register: page_timing
-      ignore_errors: true
-      changed_when: false
-
-    - name: Current page load metrics
-      debug:
-        msg: "{{ page_timing.stdout_lines }}"
-
-    # 2. Check web server response times
-    - name: Test web server response
-      uri:
-        url: "{{ site_url }}"
-        method: GET
-        return_content: no
-      register: server_response
-      ignore_errors: true
-
-    - name: Server response time
-      debug:
-        msg: "HTTP {{ server_response.status }} in {{ server_response.elapsed }}s"
-
-    # 3. Check if compression is enabled
-    - name: Test gzip compression
-      shell: "curl -H 'Accept-Encoding: gzip' -I {{ site_url }} 2>/dev/null | grep -i 'content-encoding'"
-      register: compression_check
+    - name: Check DDEV container resources
+      shell: "docker stats --no-stream --format 'table {{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}' | grep ddev"
+      register: container_stats
       ignore_errors: true
       changed_when: false
 
-    - name: Compression status
-      debug:
-        msg: "{{ 'Compression ENABLED' if 'gzip' in compression_check.stdout else 'Compression DISABLED' }}"
-
-    # 4. Enable compression if missing
-    - name: Enable gzip compression in nginx
-      blockinfile:
-        path: /etc/nginx/conf.d/compression.conf
-        create: yes
-        block: |
-          gzip on;
-          gzip_vary on;
-          gzip_proxied any;
-          gzip_comp_level 6;
-          gzip_types text/plain text/css text/xml text/javascript application/json application/javascript application/xml+rss;
-      become: true
-      when: "'gzip' not in compression_check.stdout"
-      register: compression_enabled
-      ignore_errors: true
-
-    - name: Reload nginx for compression
-      service:
-        name: nginx
-        state: reloaded
-      become: true
-      when: compression_enabled is changed
-      ignore_errors: true
-
-    # 5. Check static resource sizes
-    - name: Find large static files
-      shell: "find /var/www /home -name '*.js' -o -name '*.css' -o -name '*.jpg' -o -name '*.png' 2>/dev/null | xargs du -sh 2>/dev/null | sort -rh | head -10"
-      register: large_assets
+    - name: Check MySQL slow queries
+      shell: "cd {{ ddev_dir }} && ddev mysql -e 'SHOW FULL PROCESSLIST;' 2>/dev/null | head -20"
+      register: mysql_processes
       ignore_errors: true
       changed_when: false
 
-    - name: Large static assets
-      debug:
-        msg: "{{ large_assets.stdout_lines[:5] }}"
-
-    # 6. Check for unminified resources
-    - name: Check for unminified JS/CSS
-      shell: "find /var/www /home -name '*.js' -o -name '*.css' 2>/dev/null | grep -v '.min.' | head -5"
-      register: unminified_files
+    - name: Check PHP-FPM status
+      shell: "cd {{ ddev_dir }} && ddev exec ps aux | grep php-fpm | head -10"
+      register: php_status
       ignore_errors: true
       changed_when: false
 
-    - name: Unminified resources found
-      debug:
-        msg: "{{ unminified_files.stdout_lines | length }} unminified files"
+    - name: Clear OPcache
+      shell: "cd {{ ddev_dir }} && ddev exec php -r 'opcache_reset();' 2>/dev/null || echo 'OPcache not available'"
+      register: opcache_clear
+      ignore_errors: true
 
-    # 7. Check nginx caching configuration
-    - name: Verify browser caching headers
-      shell: "curl -I {{ site_url }}/static/style.css 2>/dev/null | grep -i 'cache-control\\|expires'"
-      register: cache_headers
+    - name: Restart DDEV to clear resources
+      shell: "cd {{ ddev_dir }} && ddev restart"
+      register: ddev_restart
+
+    - name: Wait for DDEV to stabilize
+      pause:
+        seconds: 15
+
+    - name: Test page load time after restart
+      shell: "cd {{ ddev_dir }} && ddev exec curl -s -o /dev/null -w '%{time_total}' http://localhost:80 || echo 'N/A'"
+      register: page_load_time
       ignore_errors: true
       changed_when: false
 
-    - name: Caching headers status
-      debug:
-        msg: "{{ cache_headers.stdout_lines if cache_headers.stdout_lines else 'No caching headers found' }}"
-
-    # 8. Enable browser caching if missing
-    - name: Configure browser caching
-      blockinfile:
-        path: /etc/nginx/conf.d/browser_cache.conf
-        create: yes
-        block: |
-          location ~* \.(js|css|png|jpg|jpeg|gif|ico|svg|woff|woff2|ttf)$ {
-              expires 30d;
-              add_header Cache-Control "public, immutable";
-          }
-      become: true
-      when: cache_headers.stdout_lines | length == 0
-      register: caching_configured
-      ignore_errors: true
-
-    - name: Reload nginx for caching
-      service:
-        name: nginx
-        state: reloaded
-      become: true
-      when: caching_configured is changed
-      ignore_errors: true
-
-    # 9. Re-measure page load time
-    - name: Measure page load after optimizations
-      shell: "curl -o /dev/null -s -w '%{time_total}' {{ site_url }}"
-      register: optimized_timing
-      ignore_errors: true
-      changed_when: false
-      when: compression_enabled is changed or caching_configured is changed
-
-    # 10. Report findings
     - name: Compile performance report
       set_fact:
         performance_report:
-          load_time_before: "{{ page_timing.stdout_lines[0] if page_timing.stdout_lines else 'N/A' }}"
-          load_time_after: "{{ optimized_timing.stdout if compression_enabled is changed or caching_configured is changed else 'No changes made' }}"
-          compression_enabled: "{{ compression_enabled is changed or 'gzip' in compression_check.stdout }}"
-          caching_configured: "{{ caching_configured is changed or cache_headers.stdout_lines | length > 0 }}"
-          large_assets_found: "{{ large_assets.stdout_lines | length }}"
-          unminified_resources: "{{ unminified_files.stdout_lines | length }}"
-          recommendations:
-            - "{{ 'Minify JS and CSS files' if unminified_files.stdout_lines | length > 3 else 'Minification adequate' }}"
-            - "{{ 'Optimize images (compress/resize)' if large_assets.stdout_lines | length > 5 else 'Image sizes acceptable' }}"
-            - "{{ 'Implement CDN for static assets' }}"
+          container_resources: "{{ container_stats.stdout_lines | default([]) }}"
+          mysql_processes: "{{ mysql_processes.stdout_lines[:5] | default([]) }}"
+          php_workers: "{{ php_status.stdout_lines | length | default(0) }}"
+          opcache_cleared: "{{ 'reset' not in opcache_clear.stdout | default('') }}"
+          page_load_time_seconds: "{{ page_load_time.stdout | default('N/A') }}"
+          service_restarted: true
 
-    - name: Report performance results
+    - name: Report results
       uri:
         url: "{{ callback_url }}"
         method: POST
@@ -169,6 +79,7 @@
           action_id: "{{ action_id }}"
           status: "completed"
           success: true
-          message: "Page load performance analysis completed"
+          message: "Page load optimization completed - Load time: {{ page_load_time.stdout | default('N/A') }}s"
           details: "{{ performance_report }}"
+      delegate_to: localhost
       ignore_errors: true

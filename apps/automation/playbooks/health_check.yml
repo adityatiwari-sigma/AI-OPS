@@ -1,14 +1,14 @@
 ---
 # Health Check Playbook
-# Comprehensive system health verification
+# Comprehensive health verification on DDEV server
 
-- name: System Health Check
-  hosts: "{{ target_host | default('localhost') }}"
-  gather_facts: true
+- name: System Health Check - DDEV
+  hosts: ddev_hosts
+  gather_facts: false
   vars:
     callback_url: "{{ callback | default('http://localhost:8000/automation/callback') }}"
     action_id: "{{ action_id | default('unknown') }}"
-    checks: "{{ health_checks | default('all') }}"
+    ddev_dir: "{{ ddev_project_dir | default('~/d1/regenics') }}"
 
   tasks:
     - name: Report start
@@ -19,69 +19,67 @@
         body:
           action_id: "{{ action_id }}"
           status: "running"
-          message: "Starting health check"
+          message: "Starting comprehensive health check"
+      delegate_to: localhost
       ignore_errors: true
+
+    - name: Check system uptime
+      command: "uptime"
+      register: uptime_info
+      changed_when: false
 
     - name: Check CPU usage
       shell: "top -bn1 | grep 'Cpu(s)' | awk '{print $2}'"
       register: cpu_usage
       changed_when: false
-      when: checks in ['all', 'cpu']
 
-    - name: Check memory usage
+    - name: Check memory
       command: "free -m"
       register: memory_info
       changed_when: false
-      when: checks in ['all', 'memory']
 
-    - name: Check disk usage
-      command: "df -h"
+    - name: Check disk space
+      command: "df -h /"
       register: disk_info
       changed_when: false
-      when: checks in ['all', 'disk']
 
-    - name: Check load average
-      command: "uptime"
-      register: load_info
+    - name: Check DDEV status
+      shell: "cd {{ ddev_dir }} && ddev status"
+      register: ddev_status
+      ignore_errors: true
       changed_when: false
-      when: checks in ['all', 'load']
 
-    - name: List top 5 CPU processes
-      shell: "ps aux --sort=-%cpu | head -6"
-      register: top_cpu
+    - name: Check Docker containers
+      shell: "docker ps --format 'table {{.Names}}\t{{.Status}}' | head -10"
+      register: docker_containers
+      ignore_errors: true
       changed_when: false
-      when: checks in ['all', 'processes']
-
-    - name: List top 5 memory processes
-      shell: "ps aux --sort=-%mem | head -6"
-      register: top_mem
-      changed_when: false
-      when: checks in ['all', 'processes']
 
     - name: Check network connectivity
       command: "ping -c 1 8.8.8.8"
       register: network_check
-      changed_when: false
       ignore_errors: true
-      when: checks in ['all', 'network']
+      changed_when: false
 
-    - name: Check listening ports
-      command: "netstat -tuln"
-      register: ports_info
-      changed_when: false
+    - name: Check Netdata container
+      shell: "docker ps | grep netdata && echo 'Netdata OK'"
+      register: netdata_check
       ignore_errors: true
-      when: checks in ['all', 'ports']
+      changed_when: false
 
     - name: Compile health report
       set_fact:
         health_report:
+          uptime: "{{ uptime_info.stdout | default('N/A') }}"
           cpu_usage: "{{ cpu_usage.stdout | default('N/A') }}"
-          memory: "{{ memory_info.stdout_lines | default([]) }}"
-          disk: "{{ disk_info.stdout_lines | default([]) }}"
-          load: "{{ load_info.stdout | default('N/A') }}"
+          memory: "{{ memory_info.stdout_lines[1] | default('N/A') }}"
+          disk: "{{ disk_info.stdout_lines[1] | default('N/A') }}"
+          ddev_ok: "{{ 'OK' in ddev_status.stdout | default('') }}"
+          docker_containers: "{{ docker_containers.stdout_lines | default([]) }}"
           network_ok: "{{ network_check.rc | default(1) == 0 }}"
+          netdata_ok: "{{ 'Netdata OK' in netdata_check.stdout | default('') }}"
 
-    - name: Report health check results
+    - name: Report results
       uri:
         url: "{{ callback_url }}"
         method: POST
@@ -92,4 +90,5 @@
           success: true
           message: "Health check completed"
           details: "{{ health_report }}"
+      delegate_to: localhost
       ignore_errors: true
