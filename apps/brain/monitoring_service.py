@@ -66,6 +66,7 @@ class MetricsCollector:
         self.session = None
         self.error_cache = defaultdict(int)  # Track error signatures
         self.service_health = {}  # Track service health status
+        self.service_previous_state = {}  # Track previous state for email on state change
         self.alert_rules = {}  # Cache for thresholds and rules
         self.pipeline_sim = PipelineSimulator()
         
@@ -292,7 +293,24 @@ class MetricsCollector:
                 "url": service["url"]
             }
             
+            # Detect state change and send email
+            service_key = service["name"]
+            previous_state = self.service_previous_state.get(service_key, True)  # Assume UP initially
+            
             if not is_up:
+                # Service is DOWN
+                if previous_state:  # Was UP, now DOWN - state change!
+                    from email_notifications import email_service
+                    print(f"🔔 SERVICE STATE CHANGE: {service_key} went DOWN")
+                    await email_service.send_alert(
+                        metric_name=f"{service_key} Service",
+                        severity="CRITICAL",
+                        value="DOWN",
+                        threshold="UP",
+                        category="availability",
+                        description=f"{service_key} at {service['url']} is not responding"
+                    )
+                
                 await self._trigger_alert(
                     category="availability",
                     metric_name=f"{service['name']}_down",
@@ -301,6 +319,20 @@ class MetricsCollector:
                     threshold=1,
                     metadata={"service": service["name"], "url": service["url"]}
                 )
+            else:
+                # Service is UP
+                if not previous_state:  # Was DOWN, now UP - recovery!
+                    from email_notifications import email_service
+                    print(f"✅ SERVICE RECOVERED: {service_key} is back UP")
+                    await email_service.send_recovery_notification(
+                        metric_name=f"{service_key} Service",
+                        category="availability",
+                        previous_severity="CRITICAL",
+                        description=f"{service_key} at {service['url']} has recovered"
+                    )
+            
+            # Update previous state
+            self.service_previous_state[service_key] = is_up
         
         # ============================================================
         # Check Peekaping monitors (if any configured)
@@ -989,6 +1021,8 @@ class MetricsCollector:
                             current_value: float, threshold: float, metadata: dict = None):
         """Trigger an alert if not already active"""
         import json
+        from email_notifications import email_service
+        
         async with self.db_pool.acquire() as conn:
             # Check if alert already exists and is not resolved
             existing = await conn.fetchrow("""
@@ -1010,8 +1044,18 @@ class MetricsCollector:
                 """, category, metric_name, severity, threshold, current_value, json.dumps(rounded_metadata))
                 
                 print(f"🚨 ALERT: {severity.upper()} - {category}/{metric_name} = {current_value} (threshold: {threshold})")
-                print(f"📧 Sending notification to: {{{{ALERT_EMAIL}}}}")
-                print(f"   Subject: [{severity.upper()}] {category}: {metric_name} threshold breached")
+                
+                # Send email notification for warning and critical alerts
+                if severity.lower() in ["warning", "critical"]:
+                    await email_service.send_alert(
+                        metric_name=metric_name,
+                        severity=severity.upper(),
+                        value=current_value,
+                        threshold=threshold,
+                        category=category,
+                        description=f"Threshold breached in {category}",
+                        metadata=metadata
+                    )
 
                 # Auto-create incident for critical alerts
                 if severity.lower() == "critical":
@@ -1287,13 +1331,30 @@ class MetricsCollector:
             """, alert_id, acknowledged_by)
     
     async def resolve_alert(self, alert_id: str):
-        """Mark alert as resolved"""
+        """Mark alert as resolved and send recovery notification"""
+        from email_notifications import email_service
+        
         async with self.db_pool.acquire() as conn:
+            # Get alert details before resolving
+            alert = await conn.fetchrow("""
+                SELECT category, metric_name, severity FROM active_alerts WHERE id = $1
+            """, alert_id)
+            
             await conn.execute("""
                 UPDATE active_alerts
                 SET resolved = TRUE, resolved_at = NOW()
                 WHERE id = $1
             """, alert_id)
+            
+            # Send recovery email
+            if alert and alert['severity'].lower() in ['warning', 'critical']:
+                await email_service.send_recovery_notification(
+                    metric_name=alert['metric_name'],
+                    category=alert['category'],
+                    previous_severity=alert['severity'].upper(),
+                    description=f"Alert resolved automatically"
+                )
+                print(f"✅ RESOLVED: {alert['category']}/{alert['metric_name']}")
 
     async def create_incident_from_alert(self, alert_id: str, category: str,
                                          metric_name: str, severity: str, metadata: dict):

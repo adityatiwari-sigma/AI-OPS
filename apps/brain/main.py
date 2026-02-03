@@ -4,6 +4,10 @@ LangGraph with Interrupt/Resume + PostgreSQL Persistence
 Powered by Cerebras Llama 3.3 70B + Netdata MCP
 """
 
+# Load environment variables from .env file
+from dotenv import load_dotenv
+load_dotenv()
+
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -530,6 +534,9 @@ async def run_ddev_health_monitor():
     SSH_OPTIONS = ["-i", "/home/adityatiwari/.ssh/id_ed25519", "-o", "StrictHostKeyChecking=no", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10"]
     DDEV_DIR = "~/d1/regenics"
     
+    # Import email service
+    from email_notifications import email_service
+    
     while True:
         try:
             # Check DDEV site health via SSH
@@ -548,6 +555,13 @@ async def run_ddev_health_monitor():
                 if ddev_failure_count > 0:
                     print(f"✅ DDEV recovered - site is healthy")
                     await log_audit("DDEV_RECOVERED", "system", "DDEV site is back online", {}, None)
+                    # Send recovery email
+                    await email_service.send_recovery_notification(
+                        metric_name="DDEV/WordPress Site",
+                        category="availability",
+                        previous_severity="CRITICAL",
+                        description="DDEV site has recovered and is now running"
+                    )
                 else:
                     # Log periodic status (every ~2.5 minutes = 5 checks)
                     import random
@@ -558,9 +572,30 @@ async def run_ddev_health_monitor():
                 ddev_failure_count += 1
                 print(f"⚠️ DDEV check failed ({ddev_failure_count}/{DDEV_FAILURE_THRESHOLD}): {process.stdout.strip() or process.stderr.strip()}")
                 
+                # Send email on FIRST failure
+                if ddev_failure_count == 1:
+                    await email_service.send_alert(
+                        metric_name="DDEV/WordPress Site",
+                        severity="WARNING",
+                        value="DOWN",
+                        threshold="UP",
+                        category="availability",
+                        description="DDEV site is not responding. Auto-restart will trigger after 2 consecutive failures."
+                    )
+                
                 if ddev_failure_count >= DDEV_FAILURE_THRESHOLD:
                     print(f"🔄 AUTO-RESTARTING DDEV - {ddev_failure_count} consecutive failures")
                     await log_audit("DDEV_AUTO_RESTART", "system", f"Auto-restarting DDEV after {ddev_failure_count} failures", {}, None)
+                    
+                    # Send CRITICAL email before restart
+                    await email_service.send_alert(
+                        metric_name="DDEV/WordPress Site",
+                        severity="CRITICAL",
+                        value="DOWN - AUTO-RESTARTING",
+                        threshold="UP",
+                        category="availability",
+                        description=f"DDEV site down for {ddev_failure_count} consecutive checks. Auto-restart initiated."
+                    )
                     
                     # Execute DDEV restart via SSH
                     restart_cmd = ["ssh"] + SSH_OPTIONS + [SSH_HOST, f"cd {DDEV_DIR} && ddev restart"]
