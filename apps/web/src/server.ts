@@ -75,7 +75,9 @@ app.post('/api/alerts/:id/diagnose', async (c) => {
 app.post('/api/alerts/:id/approve', async (c) => {
   try {
     const body = await c.req.json()
-    const response = await fetch('http://localhost:8000/api/create-incident', {
+
+    // First, create the incident
+    const incidentResponse = await fetch('http://localhost:8000/api/create-incident', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -86,8 +88,39 @@ app.post('/api/alerts/:id/approve', async (c) => {
         remediation_plan: body.remediation
       })
     })
-    const data = await response.json()
-    return c.json(data)
+    const incidentData = await incidentResponse.json()
+
+    // Then, trigger the SSH command execution based on the remediation
+    let sshCommand = ''
+    const remediation = (body.remediation || '').toLowerCase()
+    const metricName = (body.metric_name || '').toLowerCase()
+
+    // Map remediations to SSH commands
+    if (remediation.includes('netdata') || metricName.includes('netdata')) {
+      sshCommand = 'docker restart netdata'
+    } else if (remediation.includes('restart') && (remediation.includes('service') || remediation.includes('ddev'))) {
+      sshCommand = 'cd ~/d1/regenics && ddev restart'
+    } else if (remediation.includes('docker') && remediation.includes('restart')) {
+      sshCommand = 'docker restart netdata'
+    }
+
+    // Execute SSH command if we have one
+    let sshResult = null
+    if (sshCommand) {
+      try {
+        const sshResponse = await fetch('http://localhost:8000/api/terminal/execute', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ command: sshCommand })
+        })
+        sshResult = await sshResponse.json()
+        console.log(`🔧 SSH Executed: ${sshCommand} -> Exit: ${sshResult.exitCode}`)
+      } catch (e) {
+        console.error('SSH execution error:', e)
+      }
+    }
+
+    return c.json({ ...incidentData, ssh_executed: sshCommand, ssh_result: sshResult })
   } catch (error) {
     return c.json({ error: 'Failed to approve remediation' }, 500)
   }
@@ -355,6 +388,39 @@ app.get('/api/network/packets', async (c) => {
     return c.json(data)
   } catch (error) {
     return c.json({ packets: [], count: 0, error: 'Network sniffer not available' })
+  }
+})
+
+// ==========================================
+// TERMINAL API ENDPOINTS (proxy to brain service)
+// ==========================================
+
+// API: Test SSH connection (proxy to brain)
+app.post('/api/terminal/connect', async (c) => {
+  try {
+    const response = await fetch('http://localhost:8000/api/terminal/connect', {
+      method: 'POST'
+    })
+    const data = await response.json()
+    return c.json(data)
+  } catch (error) {
+    return c.json({ success: false, error: 'Brain service not available' })
+  }
+})
+
+// API: Execute command via SSH (proxy to brain)
+app.post('/api/terminal/execute', async (c) => {
+  try {
+    const body = await c.req.json()
+    const response = await fetch('http://localhost:8000/api/terminal/execute', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body)
+    })
+    const data = await response.json()
+    return c.json(data)
+  } catch (error) {
+    return c.json({ error: 'Brain service not available' })
   }
 })
 
@@ -1172,6 +1238,10 @@ const dashboardHTML = `<!DOCTYPE html>
           <span class="nav-icon">🚨</span>
           <span>Alerts</span>
         </div>
+        <div class="nav-item" onclick="showTab('terminal')">
+          <span class="nav-icon">💻</span>
+          <span>Terminal</span>
+        </div>
       </div>
       <div style="padding: 16px; border-top: 1px solid var(--border);">
         <div class="sidebar-title" style="margin-bottom: 12px;">Quick Stats</div>
@@ -1715,6 +1785,74 @@ const dashboardHTML = `<!DOCTYPE html>
         </div>
       </div>
     </div><!-- End view-alerts -->
+
+    <!-- VIEW: Terminal -->
+    <div id="view-terminal" class="view-section" style="display: none;">
+      <div class="dashboard" style="height: calc(100vh - 100px);">
+        <!-- Terminal Header -->
+        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px;">
+          <h2 style="margin: 0; color: var(--text-primary);">💻 SSH Terminal - DDEV Server</h2>
+          <div style="display: flex; gap: 12px; align-items: center;">
+            <span id="terminalStatus" style="font-size: 12px; color: var(--text-muted);">● Disconnected</span>
+            <button class="btn btn-sm" onclick="connectTerminal()">Connect</button>
+            <button class="btn btn-sm btn-outline" onclick="disconnectTerminal()">Disconnect</button>
+          </div>
+        </div>
+
+        <!-- Connection Info -->
+        <div style="background: var(--bg-tertiary); border-radius: 8px; padding: 12px 16px; margin-bottom: 16px; font-family: 'JetBrains Mono', monospace; font-size: 12px;">
+          <span style="color: var(--text-muted);">Host:</span> <span style="color: var(--accent);">test@10.10.2.21</span>
+          <span style="margin-left: 24px; color: var(--text-muted);">DDEV Site:</span> <span style="color: var(--text-primary);">~/d1/regenics</span>
+        </div>
+
+        <!-- Terminal Output -->
+        <div id="terminalOutput" style="
+          background: #0d1117;
+          border-radius: 8px;
+          padding: 16px;
+          height: calc(100% - 180px);
+          overflow-y: auto;
+          font-family: 'JetBrains Mono', monospace;
+          font-size: 13px;
+          color: #c9d1d9;
+          white-space: pre-wrap;
+          word-break: break-all;
+        ">
+<span style="color: #8b949e;">Welcome to AIOps SSH Terminal</span>
+<span style="color: #8b949e;">Click "Connect" to establish SSH connection to 10.10.2.21</span>
+<span style="color: #8b949e;">───────────────────────────────────────────────────</span>
+        </div>
+
+        <!-- Terminal Input -->
+        <div style="display: flex; gap: 12px; margin-top: 16px;">
+          <input type="text" id="terminalInput" 
+            placeholder="Enter command (e.g., ddev status, ddev restart)..." 
+            style="
+              flex: 1;
+              background: var(--bg-tertiary);
+              border: 1px solid var(--border);
+              border-radius: 8px;
+              padding: 12px 16px;
+              color: var(--text-primary);
+              font-family: 'JetBrains Mono', monospace;
+              font-size: 13px;
+            "
+            onkeydown="if(event.key==='Enter')sendTerminalCommand()"
+          />
+          <button class="btn" onclick="sendTerminalCommand()">Run ▶</button>
+        </div>
+
+        <!-- Quick Commands -->
+        <div style="margin-top: 16px; display: flex; gap: 8px; flex-wrap: wrap;">
+          <span style="color: var(--text-muted); font-size: 12px; margin-right: 8px;">Quick:</span>
+          <button class="btn btn-sm btn-outline" onclick="runQuickCommand('ddev status')">ddev status</button>
+          <button class="btn btn-sm btn-outline" onclick="runQuickCommand('ddev restart')">ddev restart</button>
+          <button class="btn btn-sm btn-outline" onclick="runQuickCommand('ddev logs -f')">ddev logs</button>
+          <button class="btn btn-sm btn-outline" onclick="runQuickCommand('docker ps')">docker ps</button>
+          <button class="btn btn-sm btn-outline" onclick="runQuickCommand('docker restart netdata')">netdata restart</button>
+        </div>
+      </div>
+    </div><!-- End view-terminal -->
 
   </main>
 
@@ -3000,6 +3138,97 @@ const dashboardHTML = `<!DOCTYPE html>
     setInterval(() => {
       if (currentView === 'network') loadNetworkView();
     }, 2000);
+    
+    // ==========================================
+    // TERMINAL VIEW FUNCTIONS
+    // ==========================================
+    let terminalConnected = false;
+    
+    function appendTerminalOutput(text, type = 'output') {
+      const output = document.getElementById('terminalOutput');
+      if (!output) return;
+      const line = document.createElement('div');
+      if (type === 'command') {
+        line.innerHTML = '<span style="color: #58a6ff;">$ ' + text + '</span>';
+      } else if (type === 'error') {
+        line.innerHTML = '<span style="color: #f85149;">' + text + '</span>';
+      } else if (type === 'success') {
+        line.innerHTML = '<span style="color: #3fb950;">' + text + '</span>';
+      } else {
+        line.textContent = text;
+      }
+      output.appendChild(line);
+      output.scrollTop = output.scrollHeight;
+    }
+    
+    function connectTerminal() {
+      const status = document.getElementById('terminalStatus');
+      status.innerHTML = '● Connecting...';
+      status.style.color = '#d29922';
+      
+      // Test SSH connection
+      fetch('/api/terminal/connect', { method: 'POST' })
+        .then(r => r.json())
+        .then(data => {
+          if (data.success) {
+            terminalConnected = true;
+            status.innerHTML = '● Connected';
+            status.style.color = '#3fb950';
+            appendTerminalOutput('Connected to test@10.10.2.21', 'success');
+            appendTerminalOutput('DDEV directory: ~/d1/regenics', 'output');
+            appendTerminalOutput('───────────────────────────────────────────────────', 'output');
+          } else {
+            status.innerHTML = '● Connection Failed';
+            status.style.color = '#f85149';
+            appendTerminalOutput('Failed to connect: ' + (data.error || 'Unknown error'), 'error');
+          }
+        })
+        .catch(e => {
+          status.innerHTML = '● Connection Failed';
+          status.style.color = '#f85149';
+          appendTerminalOutput('Connection error: ' + e.message, 'error');
+        });
+    }
+    
+    function disconnectTerminal() {
+      terminalConnected = false;
+      const status = document.getElementById('terminalStatus');
+      status.innerHTML = '● Disconnected';
+      status.style.color = 'var(--text-muted)';
+      appendTerminalOutput('Disconnected from server', 'output');
+    }
+    
+    async function sendTerminalCommand() {
+      const input = document.getElementById('terminalInput');
+      const command = input.value.trim();
+      if (!command) return;
+      
+      appendTerminalOutput(command, 'command');
+      input.value = '';
+      
+      try {
+        const res = await fetch('/api/terminal/execute', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ command })
+        });
+        const data = await res.json();
+        
+        if (data.output) {
+          data.output.split('\\n').forEach(line => appendTerminalOutput(line));
+        }
+        if (data.error) {
+          appendTerminalOutput(data.error, 'error');
+        }
+      } catch (e) {
+        appendTerminalOutput('Error: ' + e.message, 'error');
+      }
+    }
+    
+    function runQuickCommand(cmd) {
+      document.getElementById('terminalInput').value = cmd;
+      sendTerminalCommand();
+    }
     
     // ==========================================
     // ALERTS VIEW DATA LOADING

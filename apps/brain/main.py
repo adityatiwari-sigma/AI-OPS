@@ -447,7 +447,7 @@ Be concise and action-oriented."""
 REMEDIATION_PROMPT = """You are a Remediation Agent. When asked to fix something, you MUST use the propose_remediation tool.
 
 DO NOT describe what you would do - ACTUALLY CALL the propose_remediation function with:
-- action_type: restart_service, kill_process, clear_cache, scale_up, scale_down, restart_container, run_playbook, or custom
+- action_type: restart_service, kill_process, clear_cache, scale_up, scale_down, restart_container, netdata_down, run_playbook, or custom
 - target: The specific service, process, or component
 - description: What the action will do
 - impact: Expected impact (e.g., "2-3 seconds downtime")
@@ -729,7 +729,8 @@ async def approve_action(action_id: str, request: ApprovalRequest):
             pass
     
     if decision == "approve" and action_details:
-        # Trigger automation via EDA webhook
+        # Execute remediation via SSH
+        print(f"🔄 EXECUTING REMEDIATION: action_type={action_details.get('action_type')}, target={action_details.get('target')}")
         execution_result = await trigger_automation(action_id, action_details)
         return {
             "status": "approved",
@@ -744,11 +745,6 @@ async def approve_action(action_id: str, request: ApprovalRequest):
             "message": "Action approved (action details not found for execution)"
         }
     else:
-        return {
-            "status": "rejected",
-            "action_id": action_id,
-            "message": "Action rejected by human operator"
-        }
         return {
             "status": "rejected",
             "action_id": action_id,
@@ -781,98 +777,109 @@ ANSIBLE_EDA_URL = os.getenv("ANSIBLE_EDA_URL", "http://localhost:5000")
 
 
 async def trigger_automation(action_id: str, action: dict) -> dict:
-    """Trigger automation via Ansible EDA webhook"""
-    payload = {
-        "action_id": str(action_id),
-        "action_type": action.get("action_type", "custom"),
-        "target": action.get("target", "unknown"),
-        "description": action.get("description", ""),
-        "severity": action.get("severity", "MEDIUM"),
-        "callback_url": "http://host.docker.internal:8000/automation/callback"
-    }
+    """Execute remediation action via SSH to DDEV server"""
+    action_type = action.get("action_type", "custom")
+    target = action.get("target", "unknown")
     
-    try:
-        async with httpx.AsyncClient(timeout=5.0) as client:
-            response = await client.post(ANSIBLE_EDA_URL, json=payload)
-            await log_audit("AUTOMATION_TRIGGERED", "system", f"Sent to EDA: {action['action_type']}", payload, action_id)
-            return {
-                "triggered": True,
-                "eda_response": response.status_code,
-                "payload": payload
-            }
-    except Exception as e:
-        await log_audit("AUTOMATION_FAILED", "system", f"EDA trigger failed: {str(e)}", {}, action_id)
-        # Fallback: execute locally with subprocess
-        return await execute_local_playbook(action_id, action)
+    await log_audit("SSH_TRIGGERED", "system", f"Executing remediation: {action_type} on {target}", 
+                    {"action_type": action_type, "target": target}, action_id)
+    
+    # Directly execute via SSH (skip EDA)
+    return await execute_local_playbook(action_id, action)
 
 
 async def execute_local_playbook(action_id: str, action: dict) -> dict:
-    """Fallback: Execute playbook locally if EDA is not available"""
+    """Execute remediation action via SSH to DDEV server"""
     import subprocess
     
     action_type = action.get("action_type", "health_check")
-    target = action.get("target", "localhost")
+    target = action.get("target", "")
     
-    playbook_map = {
-        "restart_service": "restart_service.yml",
-        "kill_process": "kill_process.yml",
-        "clear_cache": "clear_cache.yml",
-        "restart_container": "restart_container.yml",
-        "health_check": "health_check.yml",
-        "run_playbook": "health_check.yml",
+    # SSH configuration for DDEV server
+    SSH_HOST = "test@10.10.2.21"
+    SSH_OPTIONS = ["-i", "/home/adityatiwari/.ssh/id_ed25519", "-o", "StrictHostKeyChecking=no", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10"]
+    DDEV_DIR = "~/d1/regenics"
+    
+    # Map playbook types to SSH commands
+    ssh_command_map = {
+        "restart_service": f"cd {DDEV_DIR} && ddev restart",
+        "restart_container": f"docker restart {target}" if target else f"cd {DDEV_DIR} && ddev restart",
+        "site_downtime": f"cd {DDEV_DIR} && ddev restart",
+        "health_check": f"cd {DDEV_DIR} && ddev status",
+        "resource_spike": "top -bn1 | head -20; free -m; df -h",
+        "page_load_slow": f"cd {DDEV_DIR} && ddev restart",
+        "http_5xx_spike": f"cd {DDEV_DIR} && ddev logs -f",
+        "app_error_spike": f"cd {DDEV_DIR} && ddev logs -f",
+        "db_latency": f"cd {DDEV_DIR} && ddev restart db",
+        "production_emergency": f"cd {DDEV_DIR} && ddev stop && ddev start",
+        "run_playbook": f"cd {DDEV_DIR} && ddev status",
+        "netdata_down": "docker restart netdata",
+        "custom": f"cd {DDEV_DIR} && ddev status",
     }
     
-    playbook = playbook_map.get(action_type, "health_check.yml")
-    # Use relative path or env var
-    workspace_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
-    playbook_path = f"{workspace_root}/apps/automation/playbooks/{playbook}"
+    # Get the SSH command for this action type
+    ssh_command = ssh_command_map.get(action_type, f"cd {DDEV_DIR} && ddev status")
+    
+    # If target contains 'netdata', use docker restart
+    if target and "netdata" in target.lower():
+        ssh_command = "docker restart netdata"
     
     try:
-        # Check if ansible-playbook is available
-        result = subprocess.run(
-            ["which", "ansible-playbook"],
-            capture_output=True,
-            text=True
-        )
+        await log_audit("SSH_EXECUTION", "system", f"Executing SSH command: {ssh_command}", {"host": SSH_HOST, "action_type": action_type}, action_id)
         
-        if result.returncode != 0:
-            return {
-                "triggered": False,
-                "error": "ansible-playbook not found",
-                "message": "Install Ansible to enable local execution"
-            }
+        # Execute SSH command
+        cmd = ["ssh"] + SSH_OPTIONS + [SSH_HOST, ssh_command]
         
-        # Run playbook
-        cmd = [
-            "ansible-playbook", playbook_path,
-            "-i", "localhost,",
-            "-c", "local",
-            "-e", f"action_id={action_id}",
-            "-e", f"target={target}",
-            "-e", f"service={target}",
-            "-e", f"process={target}",
-            "-e", f"container={target}",
-            "--check"  # Dry-run mode for safety
-        ]
-        
-        await log_audit("LOCAL_EXECUTION", "system", f"Running locally: {playbook}", {"cmd": " ".join(cmd)}, action_id)
-        
-        process = subprocess.Popen(
+        process = subprocess.run(
             cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True
+            capture_output=True,
+            text=True,
+            timeout=60
         )
+        
+        success = process.returncode == 0
+        output = process.stdout if success else process.stderr
+        
+        await log_audit(
+            "SSH_COMPLETED" if success else "SSH_FAILED",
+            "system",
+            f"SSH execution {'succeeded' if success else 'failed'}: {output[:200]}",
+            {"output": output[:500], "exit_code": process.returncode},
+            action_id
+        )
+        
+        # Update action status in database
+        final_status = "COMPLETED" if success else "FAILED"
+        if db_pool:
+            try:
+                async with db_pool.acquire() as conn:
+                    await conn.execute('''
+                        UPDATE pending_actions 
+                        SET status = $1
+                        WHERE id = $2
+                    ''', final_status, uuid.UUID(action_id))
+            except Exception as e:
+                print(f"DB error updating status: {e}")
         
         return {
             "triggered": True,
-            "execution_mode": "local_dry_run",
-            "playbook": playbook,
-            "target": target,
-            "message": "Playbook executed in dry-run mode"
+            "execution_mode": "ssh_direct",
+            "ssh_command": ssh_command,
+            "host": SSH_HOST,
+            "success": success,
+            "output": output[:500],
+            "exit_code": process.returncode,
+            "message": f"SSH command executed on {SSH_HOST}"
         }
         
+    except subprocess.TimeoutExpired:
+        await log_audit("SSH_TIMEOUT", "system", "SSH command timed out after 60s", {}, action_id)
+        return {
+            "triggered": False,
+            "error": "SSH command timed out"
+        }
     except Exception as e:
+        await log_audit("SSH_ERROR", "system", f"SSH execution error: {str(e)}", {}, action_id)
         return {
             "triggered": False,
             "error": str(e)
@@ -1061,6 +1068,67 @@ async def get_network_stats():
     """Get network capture statistics"""
     sniffer = get_network_sniffer()
     return sniffer.get_stats()
+
+
+# ============================================================================
+# TERMINAL SSH ENDPOINTS
+# ============================================================================
+SSH_HOST = "test@10.10.2.21"
+SSH_OPTIONS = ["-i", "/home/adityatiwari/.ssh/id_ed25519", "-o", "StrictHostKeyChecking=no", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10"]
+DDEV_DIR = "~/d1/regenics"
+
+
+class TerminalCommand(BaseModel):
+    command: str
+
+
+@app.post("/api/terminal/connect")
+async def terminal_connect():
+    """Test SSH connection to DDEV server"""
+    import subprocess
+    try:
+        result = subprocess.run(
+            ["ssh"] + SSH_OPTIONS + [SSH_HOST, "echo connected"],
+            capture_output=True,
+            text=True,
+            timeout=15
+        )
+        if result.returncode == 0 and "connected" in result.stdout:
+            return {"success": True, "message": f"Connected to {SSH_HOST}"}
+        else:
+            return {"success": False, "error": result.stderr or "SSH connection failed"}
+    except subprocess.TimeoutExpired:
+        return {"success": False, "error": "SSH connection timed out"}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+@app.post("/api/terminal/execute")
+async def terminal_execute(req: TerminalCommand):
+    """Execute command via SSH on DDEV server"""
+    import subprocess
+    command = req.command
+    
+    # Prepend cd to DDEV directory for ddev commands
+    if command.startswith("ddev "):
+        command = f"cd {DDEV_DIR} && {command}"
+    
+    try:
+        result = subprocess.run(
+            ["ssh"] + SSH_OPTIONS + [SSH_HOST, command],
+            capture_output=True,
+            text=True,
+            timeout=60
+        )
+        return {
+            "output": result.stdout,
+            "error": result.stderr if result.returncode != 0 else None,
+            "exitCode": result.returncode
+        }
+    except subprocess.TimeoutExpired:
+        return {"output": "", "error": "Command timed out after 60s", "exitCode": -1}
+    except Exception as e:
+        return {"output": "", "error": str(e), "exitCode": -1}
 
 
 @app.websocket("/ws")
