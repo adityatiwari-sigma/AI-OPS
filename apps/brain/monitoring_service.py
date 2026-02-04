@@ -350,6 +350,10 @@ class MetricsCollector:
                 up_monitors = 0
                 
                 for monitor in monitors:
+                    # Skip "My monitor" as requested by user to avoid false alerts
+                    if monitor['name'] == "My monitor":
+                        continue
+                        
                     total_monitors += 1
                     
                     # Get latest stats for this monitor (ignore empty rows)
@@ -384,29 +388,37 @@ class MetricsCollector:
                     }
                     
                     # Trigger alert if down
+                    # Trigger alert if down
                     if not is_up:
-                        await self._trigger_alert(
-                            category="availability",
-                            metric_name=f"{monitor['name']}_down",
-                            severity="critical",
-                            current_value=0,
-                            threshold=1,
-                            metadata={
-                                "service": monitor['name'], 
-                                "last_error": heartbeat['msg'] if heartbeat else "No heartbeat"
-                            }
-                        )
+                        # User requested to remove monitor down alerts due to false positives
+                        pass
+                        # await self._trigger_alert(
+                        #     category="availability",
+                        #     metric_name=f"{monitor['name']}_down",
+                        #     severity="critical",
+                        #     current_value=0,
+                        #     threshold=1,
+                        #     metadata={
+                        #         "service": monitor['name'], 
+                        #         "last_error": heartbeat['msg'] if heartbeat else "No heartbeat"
+                        #     }
+                        # )
                 
-                # Calculate overall uptime based on stats history (last 24h)
+                # Calculate overall uptime based on heartbeats history (last 24h)
+                # Using heartbeats count is more reliable than stats table
                 uptime_stats = await conn.fetchrow("""
-                    SELECT SUM(up) as total_up, SUM(down) as total_down
-                    FROM stats
-                    WHERE timestamp > NOW() - INTERVAL '24 hours'
-                """)
+                    SELECT 
+                        COUNT(*) as total_checks,
+                        SUM(CASE WHEN status = 1 THEN 1 ELSE 0 END) as up_checks
+                    FROM heartbeats
+                    WHERE time > NOW() - INTERVAL '24 hours' AND monitor_id = $1
+                """, monitor['id'])
                 
-                total_checks = (uptime_stats['total_up'] or 0) + (uptime_stats['total_down'] or 0)
+                total_checks = uptime_stats['total_checks'] or 0
+                up_checks = uptime_stats['up_checks'] or 0
+                
                 if total_checks > 0:
-                    uptime_percentage = round((uptime_stats['total_up'] / total_checks) * 100, 3)
+                    uptime_percentage = round((up_checks / total_checks) * 100, 3)
                 else:
                     uptime_percentage = 100.0
 
@@ -418,13 +430,20 @@ class MetricsCollector:
                 }
                 
                 if uptime_percentage < thresh:
-                    await self._trigger_alert(
-                        category="availability",
-                        metric_name="uptime_percentage",
-                        severity="critical",
-                        current_value=uptime_percentage,
-                        threshold=thresh
-                    )
+                    # User requested to remove uptime alerts due to unreliable data
+                    pass
+                    # await self._trigger_alert(
+                    #     category="availability",
+                    #     metric_name=f"uptime_percentage_{monitor['name']}",
+                    #     severity="critical",
+                    #     current_value=uptime_percentage,
+                    #     threshold=thresh,
+                    #     metadata={
+                    #         "service": monitor['name'],
+                    #         "checks": total_checks,
+                    #         "up": up_checks
+                    #     }
+                    # )
 
         except Exception as e:
             print(f"Error collecting availability from Peekaping: {e}")
@@ -500,20 +519,23 @@ class MetricsCollector:
             """, service_name, status, response_time, consecutive_failures)
     
     async def _calculate_uptime(self) -> float:
-        """Calculate uptime percentage from last 24 hours"""
-        async with self.db_pool.acquire() as conn:
-            # Get health checks from last 24 hours
-            result = await conn.fetchrow("""
-                SELECT 
-                    COUNT(*) as total_checks,
-                    COUNT(*) FILTER (WHERE status = 'up') as up_checks
-                FROM service_health
-                WHERE last_check > NOW() - INTERVAL '24 hours'
-            """)
+        """Calculate uptime percentage based on Netdata system uptime
+        
+        User requested to take value from Netdata. Since Netdata reports system uptime (duration),
+        we proxy this as: If system is up (uptime > 0), then Availability is 100%.
+        """
+        try:
+            # Check system uptime from Netdata
+            uptime_seconds = await self._get_netdata_metric("system.uptime")
             
-            if result and result['total_checks'] > 0:
-                return (result['up_checks'] / result['total_checks']) * 100
-            return 100.0
+            if uptime_seconds > 0:
+                print(f"✅ Netdata System Uptime: {uptime_seconds}s -> Reporting 100% Availability")
+                return 100.0
+            
+            return 0.0
+        except Exception as e:
+            print(f"Error getting uptime from Netdata: {e}")
+            return 0.0
     
     # ============================================================
     # 2. PERFORMANCE METRICS
@@ -803,7 +825,82 @@ class MetricsCollector:
             )
         
         await self._store_metrics(metrics)
+        
+        # Run prediction analysis for CPU and Memory
+        await self._check_resource_prediction("cpu_percent", cpu_percent)
+        await self._check_resource_prediction("memory_percent", mem_percent)
+        
         return metrics
+
+    async def _check_resource_prediction(self, metric_name: str, current_value: float):
+        """Predict when resource will hit 100% using linear regression"""
+        if current_value < 50:
+            return  # Only predict if usage is somewhat high
+            
+        try:
+            async with self.db_pool.acquire() as conn:
+                # Fetch last 30 minutes of data
+                rows = await conn.fetch("""
+                    SELECT extract(epoch from timestamp) as ts, value 
+                    FROM metrics_history 
+                    WHERE metric_name = $1 AND timestamp > NOW() - INTERVAL '30 minutes'
+                    ORDER BY timestamp ASC
+                """, metric_name)
+                
+                if len(rows) < 10:
+                    return  # Not enough data points
+                
+                # Prepare data for regression
+                timestamps = [r['ts'] for r in rows]
+                values = [float(r['value']) for r in rows]
+                
+                # Normalize time (start from 0)
+                start_time = timestamps[0]
+                x = [t - start_time for t in timestamps]
+                y = values
+                
+                n = len(x)
+                sum_x = sum(x)
+                sum_y = sum(y)
+                sum_xy = sum(xi*yi for xi, yi in zip(x, y))
+                sum_x2 = sum(xi**2 for xi in x)
+                
+                if (n * sum_x2 - sum_x**2) == 0:
+                    return
+                    
+                # Calculate slope (m) and intercept (b)
+                # y = mx + b
+                m = (n * sum_xy - sum_x * sum_y) / (n * sum_x2 - sum_x**2)
+                b = (sum_y - m * sum_x) / n
+                
+                # If slope is positive (increasing usage)
+                if m > 0.01:  # growing at least 0.01% per second (0.6% per min, 36% per hour)
+                    # Solve for y=100 ==> 100 = mx + b ==> x = (100 - b) / m
+                    time_to_100 = (100 - b) / m
+                    
+                    # Current time offset
+                    current_x = x[-1]
+                    remaining_seconds = time_to_100 - current_x
+                    
+                    if 0 < remaining_seconds < 1800:  # If crash predicted within 30 mins
+                        minutes_left = int(remaining_seconds / 60)
+                        
+                        await self._trigger_alert(
+                            category="prediction",
+                            metric_name=f"predicted_{metric_name}_exhaustion",
+                            severity="warning",  # Predictive is warning, not critical yet
+                            current_value=minutes_left,
+                            threshold=30,
+                            metadata={
+                                "prediction": f"Service predicted to crash in {minutes_left} minutes based on current trend",
+                                "slope": round(m * 60, 2), # growth per minute
+                                "current_usage": current_value
+                            }
+                        )
+                        print(f"🔮 PREDICTION: {metric_name} will hit 100% in {minutes_left} minutes (Slope: {m:.4f})")
+                        
+        except Exception as e:
+            print(f"Prediction error: {e}")
     
     async def _get_cpu_usage_percent(self) -> float:
         """Get CPU usage percentage from Netdata"""
@@ -1057,12 +1154,12 @@ class MetricsCollector:
                         metadata=metadata
                     )
 
-                # Auto-create incident for critical alerts
-                if severity.lower() == "critical":
+                # Auto-create incident for critical and warning alerts
+                if severity.lower() in ["critical", "warning"]:
                     await incident_manager.create_incident(
-                        title=f"{category.title()}: {metric_name} Critical Alert",
+                        title=f"{category.title()}: {metric_name} {severity.title()} Alert",
                         description=f"Threshold breached: {current_value} (Limit: {threshold}). \nMetadata: {json.dumps(metadata or {})}",
-                        severity="CRITICAL",
+                        severity=severity.upper(),
                         source="MonitoringService"
                     )
     
